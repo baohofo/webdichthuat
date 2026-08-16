@@ -181,6 +181,7 @@ let activeSubtitleTab = 'translated'; // 'original' | 'translated'
 let allHistoryJobs = [];
 let isGeminiConfigured = false;
 let subtitlePosition = { x: 0.50, y: 0.88 }; // Tọa độ tương đối chuẩn hóa (0.0 đến 1.0)
+let workspaceGeneration = 0; // Generation Token chống race condition stale response (Section 5)
 
 // Poller State
 let activePollTimer = null;
@@ -273,7 +274,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Tải trạng thái Gemini API Key đã lưu (TEST 36, 37)
   await loadGeminiStatus();
 
-  // Restore Job hoặc Batch sau khi F5 (TEST 10, TEST 11, TEST 9)
+  // Restore Job hoặc Batch sau khi F5 (CASE A: Đang xem Job hợp lệ / CASE B: NO_JOB)
   const savedBatchId = localStorage.getItem('last_batch_id');
   const savedJobId = localStorage.getItem('last_job_id');
 
@@ -1127,11 +1128,12 @@ async function handleRetry(resumeFromFailed = true) {
 function startJobPolling(jobId) {
   stopPolling();
   activePollJobId = jobId;
+  const pollGeneration = workspaceGeneration;
 
   activePollTimer = setInterval(async () => {
     try {
-      // Race Condition Protection (TEST 11, 12, 22, 23)
-      if (activePollJobId !== jobId || currentJobId !== jobId) {
+      // Race Condition & Generation Token Protection (TEST 11, 12, 19, 29, 31)
+      if (activePollJobId !== jobId || currentJobId !== jobId || workspaceGeneration !== pollGeneration) {
         stopPolling();
         return;
       }
@@ -1139,7 +1141,7 @@ function startJobPolling(jobId) {
       const job = await apiClient.getJob(jobId);
 
       // Kiểm tra lại sau khi await để tránh state overwrite nếu người dùng đã chuyển job/reset
-      if (activePollJobId !== jobId || currentJobId !== jobId) {
+      if (activePollJobId !== jobId || currentJobId !== jobId || workspaceGeneration !== pollGeneration) {
         return;
       }
 
@@ -1150,7 +1152,7 @@ function startJobPolling(jobId) {
         isProcessing = false;
         runPipelineBtn.disabled = false;
         runPipelineBtn.classList.remove('btn-disabled');
-        runPipelineBtn.innerHTML = '<span>🚀</span> BẮT ĐẦU XỬ LÝ';
+        runPipelineBtn.innerHTML = job.status === 'failed' ? '<span>🔄</span> THỬ LẠI XỬ LÝ' : '<span>🚀</span> BẮT ĐẦU XỬ LÝ';
 
         if (job.status === 'completed') {
           showToast('Xử lý video hoàn tất thành công!');
@@ -1166,17 +1168,18 @@ function startJobPolling(jobId) {
 
 function startBatchPolling(batchId) {
   if (activeBatchPollTimer) clearInterval(activeBatchPollTimer);
+  const batchPollGeneration = workspaceGeneration;
 
   activeBatchPollTimer = setInterval(async () => {
     try {
-      if (currentBatchId !== batchId) {
+      if (currentBatchId !== batchId || workspaceGeneration !== batchPollGeneration) {
         clearInterval(activeBatchPollTimer);
         activeBatchPollTimer = null;
         return;
       }
 
       const batch = await apiClient.getBatch(batchId);
-      if (currentBatchId !== batchId) return;
+      if (currentBatchId !== batchId || workspaceGeneration !== batchPollGeneration) return;
 
       if (batch.jobs_detail) {
         batchJobs = batch.jobs_detail;
@@ -1693,8 +1696,10 @@ function renderHistoryList() {
   });
 }
 
-// ================= RESTORE & NO_JOB WORKFLOWS (Requirements 17-25) =================
+// ================= RESET WORKSPACE TO NO_JOB =================
 function resetWorkspaceToNoJob() {
+  workspaceGeneration++; // Tăng generation token để tự động hủy mọi pending response cũ (Section 5)
+  
   stopPolling();
   if (activeBatchPollTimer) {
     clearInterval(activeBatchPollTimer);
@@ -1723,6 +1728,7 @@ function resetWorkspaceToNoJob() {
   batchQueueBar.style.display = 'none';
   batchResultsWrapper.style.display = 'none';
   retryActionBox.style.display = 'none';
+  retryErrorMessage.textContent = '';
 
   // 3. Reset Video Badges & Metadata
   videoBadgeName.textContent = '🎬 Chưa có video';
@@ -1743,8 +1749,9 @@ function resetWorkspaceToNoJob() {
   progressBox.style.display = 'none';
   progressBarFill.style.width = '0%';
   progressPercent.textContent = '0%';
+  progressStatus.textContent = 'Chờ xử lý';
 
-  // 5. Reset Stepper, Pipeline Pills & Log Table
+  // 5. Reset Stepper, Pipeline Pills, Log Table & Subtitle Data
   renderPipelinePills({});
   renderStepperItems({});
   renderProcessingLogs({});
@@ -1770,8 +1777,9 @@ function resetWorkspaceToNoJob() {
 
 async function restoreJobState(jobId) {
   try {
+    const currentGen = ++workspaceGeneration;
     const job = await apiClient.getJob(jobId);
-    if (!job || !job.job_id) {
+    if (!job || !job.job_id || workspaceGeneration !== currentGen) {
       resetWorkspaceToNoJob();
       return;
     }
