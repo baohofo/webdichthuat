@@ -170,6 +170,7 @@ const systemAlertText = document.getElementById('systemAlertText');
 const toastContainer = document.getElementById('toastContainer');
 
 // ================= APPLICATION STATE =================
+let workspaceMode = 'no_job'; // 'no_job' | 'job' | 'batch' (Section 10)
 let currentJobId = null;
 let currentBatchId = null;
 let batchJobs = []; // Array of Job items in current batch
@@ -187,6 +188,23 @@ let workspaceGeneration = 0; // Generation Token chống race condition stale re
 let activePollTimer = null;
 let activePollJobId = null;
 let activeBatchPollTimer = null;
+
+/**
+ * Guard ở tất cả Job-specific Renderers & Async Callbacks (Section 3 & 4):
+ * Bất kỳ renderer nào khi workspaceMode === 'no_job' hoặc currentJobId === null đều KHÔNG ĐƯỢC PHÉP thực thi.
+ */
+function canApplyJobPayload(jobId, generation) {
+  if (workspaceMode === 'no_job' || currentJobId === null) {
+    return false;
+  }
+  if (jobId && currentJobId && jobId !== currentJobId) {
+    return false;
+  }
+  if (generation !== undefined && generation !== workspaceGeneration) {
+    return false;
+  }
+  return true;
+}
 
 const ALLOWED_EXTENSIONS = ['.mp4', '.mov', '.mkv', '.webm'];
 
@@ -275,10 +293,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadGeminiStatus();
 
   // Restore Job hoặc Batch sau khi F5 (CASE A: Đang xem Job hợp lệ / CASE B: NO_JOB)
+  const savedWorkspaceMode = localStorage.getItem('workspace_mode');
   const savedBatchId = localStorage.getItem('last_batch_id');
   const savedJobId = localStorage.getItem('last_job_id');
 
-  if (savedBatchId) {
+  if (savedWorkspaceMode === 'no_job') {
+    resetWorkspaceToNoJob();
+  } else if (savedWorkspaceMode === 'batch' && savedBatchId) {
     await restoreBatchState(savedBatchId);
   } else if (savedJobId) {
     await restoreJobState(savedJobId);
@@ -817,11 +838,13 @@ async function handleFilesSelected(files) {
         progressPercent.textContent = `${pct}%`;
       });
 
+      workspaceMode = 'job';
       currentJobId = res.job_id;
       currentBatchId = null;
       batchJobs = [res];
       activeJobIndex = 0;
       currentSegments = [];
+      localStorage.setItem('workspace_mode', 'job');
       localStorage.setItem('last_job_id', currentJobId);
       localStorage.removeItem('last_batch_id');
 
@@ -838,12 +861,14 @@ async function handleFilesSelected(files) {
         progressPercent.textContent = `${pct}%`;
       });
 
+      workspaceMode = 'batch';
       currentBatchId = res.batch_id;
       batchJobs = res.jobs;
       activeJobIndex = 0;
       currentJobId = batchJobs[0].job_id;
       currentSegments = [];
 
+      localStorage.setItem('workspace_mode', 'batch');
       localStorage.setItem('last_batch_id', currentBatchId);
       localStorage.setItem('last_job_id', currentJobId);
 
@@ -1229,6 +1254,11 @@ function stopPolling() {
 // ================= RENDER JOB STATE =================
 function renderJobState(job) {
   if (!job) return;
+
+  // Strict NO_JOB and Stale Payload Guard (Section 3 & 4)
+  if (!canApplyJobPayload(job.job_id)) {
+    return;
+  }
 
   const stages = job.stages || {};
   const progress = Math.min(100, Math.max(0, job.progress || 0));
@@ -1699,6 +1729,7 @@ function renderHistoryList() {
 // ================= RESET WORKSPACE TO NO_JOB =================
 function resetWorkspaceToNoJob() {
   workspaceGeneration++; // Tăng generation token để tự động hủy mọi pending response cũ (Section 5)
+  workspaceMode = 'no_job'; // Explicit workspace state (Section 10)
   
   stopPolling();
   if (activeBatchPollTimer) {
@@ -1713,9 +1744,14 @@ function resetWorkspaceToNoJob() {
   currentSegments = [];
   isProcessing = false;
 
+  localStorage.setItem('workspace_mode', 'no_job');
   localStorage.removeItem('last_job_id');
   localStorage.removeItem('last_batch_id');
 
+  renderNoJobState();
+}
+
+function renderNoJobState() {
   // 1. Reset Video Player & Dropzone
   videoPreview.pause();
   videoPreview.removeAttribute('src');
@@ -1755,6 +1791,7 @@ function resetWorkspaceToNoJob() {
   renderPipelinePills({});
   renderStepperItems({});
   renderProcessingLogs({});
+  currentSegments = [];
   renderSubtitles();
 
   // 6. Reset Final Output Card
@@ -1784,10 +1821,12 @@ async function restoreJobState(jobId) {
       return;
     }
 
+    workspaceMode = 'job';
     currentJobId = jobId;
     currentBatchId = null;
     batchJobs = [job];
     activeJobIndex = 0;
+    localStorage.setItem('workspace_mode', 'job');
     localStorage.setItem('last_job_id', jobId);
     localStorage.removeItem('last_batch_id');
 
@@ -1808,16 +1847,22 @@ async function restoreJobState(jobId) {
 
 async function restoreBatchState(batchId) {
   try {
+    const currentGen = ++workspaceGeneration;
     const batch = await apiClient.getBatch(batchId);
-    if (!batch || !batch.batch_id || !batch.jobs_detail || batch.jobs_detail.length === 0) {
+    if (!batch || !batch.batch_id || !batch.jobs_detail || batch.jobs_detail.length === 0 || workspaceGeneration !== currentGen) {
       resetWorkspaceToNoJob();
       return;
     }
 
+    workspaceMode = 'batch';
     currentBatchId = batchId;
     batchJobs = batch.jobs_detail || [];
     activeJobIndex = batch.current_job_index >= 0 ? batch.current_job_index : 0;
     currentJobId = batch.current_job_id || (batchJobs[0] ? batchJobs[0].job_id : null);
+
+    localStorage.setItem('workspace_mode', 'batch');
+    localStorage.setItem('last_batch_id', batchId);
+    if (currentJobId) localStorage.setItem('last_job_id', currentJobId);
 
     renderBatchQueueBar();
     renderBatchResults(batch);
