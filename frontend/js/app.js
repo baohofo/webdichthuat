@@ -169,8 +169,9 @@ const systemAlert = document.getElementById('systemAlert');
 const systemAlertText = document.getElementById('systemAlertText');
 const toastContainer = document.getElementById('toastContainer');
 
-// ================= APPLICATION STATE =================
+// ================= APPLICATION CENTRAL STATE =================
 let workspaceMode = 'no_job'; // 'no_job' | 'job' | 'batch' (Section 10)
+let currentJob = null;
 let currentJobId = null;
 let currentBatchId = null;
 let batchJobs = []; // Array of Job items in current batch
@@ -178,6 +179,15 @@ let activeJobIndex = 0;
 let isProcessing = false;
 let previewAudioObj = null;
 let currentSegments = [];
+let translatedSegments = [];
+let subtitleData = [];
+let jobArtifacts = null;
+let pipelineState = null;
+let progressState = 0;
+let errorState = null;
+let retryState = null;
+let currentOutput = null;
+
 let activeSubtitleTab = 'translated'; // 'original' | 'translated'
 let allHistoryJobs = [];
 let isGeminiConfigured = false;
@@ -188,6 +198,32 @@ let workspaceGeneration = 0; // Generation Token chống race condition stale re
 let activePollTimer = null;
 let activePollJobId = null;
 let activeBatchPollTimer = null;
+
+/**
+ * Xóa sạch toàn bộ Central State Data Model trước khi render lại DOM
+ */
+function clearCentralJobState() {
+  currentJob = null;
+  currentJobId = null;
+  currentBatchId = null;
+  batchJobs = [];
+  activeJobIndex = 0;
+  currentSegments = [];
+  translatedSegments = [];
+  subtitleData = [];
+  jobArtifacts = null;
+  pipelineState = null;
+  progressState = 0;
+  errorState = null;
+  retryState = null;
+  currentOutput = null;
+  isProcessing = false;
+
+  if (previewAudioObj) {
+    previewAudioObj.pause();
+    previewAudioObj = null;
+  }
+}
 
 /**
  * Guard ở tất cả Job-specific Renderers & Async Callbacks (Section 3 & 4):
@@ -546,10 +582,15 @@ function initEventListeners() {
 
   subSearchInput.addEventListener('input', () => renderSubtitles());
   refreshSubsBtn.addEventListener('click', () => {
-    if (currentJobId) {
-      apiClient.getJob(currentJobId).then((job) => {
-        if (job.segments) {
+    if (currentJobId && workspaceMode === 'job') {
+      const curGen = workspaceGeneration;
+      const targetJobId = currentJobId;
+      apiClient.getJob(targetJobId).then((job) => {
+        if (!canApplyJobPayload(targetJobId, curGen)) return;
+        if (job && job.segments) {
           currentSegments = job.segments;
+          translatedSegments = job.segments.filter((s) => s.translated_text);
+          subtitleData = job.segments;
           renderSubtitles();
           showToast('Đã làm mới danh sách phụ đề');
         }
@@ -808,6 +849,9 @@ function getSubtitleStyleConfig() {
 async function handleFilesSelected(files) {
   if (!files || files.length === 0) return;
 
+  // 1. Luôn Reset sạch workspace trước khi thực hiện upload file mới (Unified cleanup)
+  resetWorkspaceToNoJob();
+
   // Validate số lượng file (1 đến 5 video)
   if (files.length > 5) {
     showToast('Tối đa 5 video cho mỗi lượt xử lý (TEST 5)', 'error');
@@ -839,11 +883,16 @@ async function handleFilesSelected(files) {
       });
 
       workspaceMode = 'job';
+      currentJob = res;
       currentJobId = res.job_id;
       currentBatchId = null;
       batchJobs = [res];
       activeJobIndex = 0;
       currentSegments = [];
+      translatedSegments = [];
+      subtitleData = [];
+      pipelineState = res.stages || { upload: { status: 'completed' }, metadata: { status: 'completed' } };
+
       localStorage.setItem('workspace_mode', 'job');
       localStorage.setItem('last_job_id', currentJobId);
       localStorage.removeItem('last_batch_id');
@@ -865,8 +914,12 @@ async function handleFilesSelected(files) {
       currentBatchId = res.batch_id;
       batchJobs = res.jobs;
       activeJobIndex = 0;
+      currentJob = batchJobs[0];
       currentJobId = batchJobs[0].job_id;
       currentSegments = [];
+      translatedSegments = [];
+      subtitleData = [];
+      pipelineState = batchJobs[0].stages || { upload: { status: 'completed' }, metadata: { status: 'completed' } };
 
       localStorage.setItem('workspace_mode', 'batch');
       localStorage.setItem('last_batch_id', currentBatchId);
@@ -881,8 +934,7 @@ async function handleFilesSelected(files) {
     }
   } catch (err) {
     showToast(err.message || 'Lỗi khi tải lên file', 'error');
-    dropzone.style.display = 'flex';
-    progressBox.style.display = 'none';
+    resetWorkspaceToNoJob();
   }
 }
 
@@ -1260,6 +1312,18 @@ function renderJobState(job) {
     return;
   }
 
+  currentJob = job;
+  currentJobId = job.job_id;
+  pipelineState = job.stages || {};
+  progressState = job.progress || 0;
+  errorState = job.error || null;
+  jobArtifacts = job.artifacts || null;
+  if (job.segments) {
+    currentSegments = job.segments;
+    translatedSegments = job.segments.filter((s) => s.translated_text);
+    subtitleData = job.segments;
+  }
+
   const stages = job.stages || {};
   const progress = Math.min(100, Math.max(0, job.progress || 0));
   const isFailed = job.status === 'failed';
@@ -1303,10 +1367,7 @@ function renderJobState(job) {
   renderProcessingLogs(stages);
 
   // 5. Subtitles & Segments
-  if (job.segments && job.segments.length > 0) {
-    currentSegments = job.segments;
-    renderSubtitles();
-  }
+  renderSubtitles();
 
   // 6. Final Video Output Card
   renderFinalVideoOutput(job);
@@ -1737,17 +1798,15 @@ function resetWorkspaceToNoJob() {
     activeBatchPollTimer = null;
   }
 
-  currentJobId = null;
-  currentBatchId = null;
-  batchJobs = [];
-  activeJobIndex = 0;
-  currentSegments = [];
-  isProcessing = false;
+  // 1. Clear Central State FIRST before DOM
+  clearCentralJobState();
 
+  // 2. Persist NO_JOB and purge local storage
   localStorage.setItem('workspace_mode', 'no_job');
   localStorage.removeItem('last_job_id');
   localStorage.removeItem('last_batch_id');
 
+  // 3. Render clean NO_JOB DOM state
   renderNoJobState();
 }
 
@@ -1760,13 +1819,7 @@ function renderNoJobState() {
   dropzone.style.display = 'flex';
   fileInput.value = '';
 
-  // 2. Hide Batch & Retry UI
-  batchQueueBar.style.display = 'none';
-  batchResultsWrapper.style.display = 'none';
-  retryActionBox.style.display = 'none';
-  retryErrorMessage.textContent = '';
-
-  // 3. Reset Video Badges & Metadata
+  // 2. Reset Video Badges & Metadata
   videoBadgeName.textContent = '🎬 Chưa có video';
   videoBadgeRes.textContent = '🔲 —';
   videoBadgeDuration.textContent = '⏱ —';
@@ -1781,32 +1834,69 @@ function renderNoJobState() {
   videoSize.textContent = '—';
   videoUploadDate.textContent = '—';
 
-  // 4. Reset Progress Bar
+  // 3. Reset Progress Bar & Status (Full Reset)
   progressBox.style.display = 'none';
   progressBarFill.style.width = '0%';
+  progressBarFill.style.background = 'linear-gradient(90deg, #10b981 0%, #06b6d4 100%)';
   progressPercent.textContent = '0%';
   progressStatus.textContent = 'Chờ xử lý';
+
+  // 4. Hide Retry & Error UI and reset buttons
+  retryActionBox.style.display = 'none';
+  retryErrorMessage.textContent = '';
+  btnRetryFailed.disabled = false;
+  btnRerunAll.disabled = false;
+  btnRetryFailed.innerHTML = '<span>🔄</span> Thử lại từ đoạn lỗi';
+  btnRerunAll.innerHTML = '<span>🔁</span> Chạy lại toàn bộ';
 
   // 5. Reset Stepper, Pipeline Pills, Log Table & Subtitle Data
   renderPipelinePills({});
   renderStepperItems({});
   renderProcessingLogs({});
   currentSegments = [];
+  translatedSegments = [];
+  subtitleData = [];
+  if (subSearchInput) subSearchInput.value = '';
   renderSubtitles();
 
-  // 6. Reset Final Output Card
+  // 6. Reset Final Output Card & Download Actions
   finalVideoEmpty.style.display = 'flex';
   finalVideoContent.style.display = 'none';
   finalVideoStatusBadge.textContent = '⚪ Chờ xử lý';
+  finalVideoStatusBadge.style.color = 'var(--text-dim)';
+  finalVideoPlayer.pause();
+  finalVideoPlayer.removeAttribute('src');
+  finalVideoPlayer.load();
+  finalThumbDuration.textContent = '00:00';
+  finalVideoName.textContent = '—';
+  finalVideoRes.textContent = '—';
+  finalVideoFormat.textContent = '—';
+  finalVideoSize.textContent = '—';
+  finalVideoDuration.textContent = '—';
+  finalVideoDate.textContent = '—';
+
+  downloadVideoBtn.removeAttribute('href');
   downloadVideoBtn.disabled = true;
   downloadVideoBtn.classList.add('btn-disabled');
 
-  // 7. Reset Primary START Button (Disabled khi chưa có video)
+  downloadSrtBtn.removeAttribute('href');
+  downloadSrtBtn.disabled = true;
+  downloadSrtBtn.classList.add('btn-disabled');
+
+  // 7. Reset Batch UI
+  batchQueueBar.style.display = 'none';
+  batchResultsWrapper.style.display = 'none';
+  queueCountBadge.textContent = '0/5 video';
+  queueTotalProgress.textContent = '0%';
+  queuePillsList.innerHTML = '';
+  batchResultsList.innerHTML = '';
+
+  // 8. Reset Primary START Button (Disabled khi chưa có video)
   runPipelineBtn.disabled = true;
   runPipelineBtn.classList.add('btn-disabled');
   runPipelineBtn.innerHTML = '<span>🚀</span> BẮT ĐẦU XỬ LÝ';
 
-  // 8. Hide Subtitle Overlay in Clean NO_JOB state
+  // 9. Hide Subtitle Overlay in Clean NO_JOB state
   if (subtitleLiveOverlay) {
     subtitleLiveOverlay.style.display = 'none';
   }
@@ -1886,12 +1976,7 @@ async function restoreBatchState(batchId) {
 
 // ================= NEW VIDEO WORKFLOW (Phase 4 / TEST 6) =================
 function handleNewVideoWorkflow() {
-  if (isProcessing) {
-    if (!confirm('Đang có tác vụ xử lý. Bạn có chắc muốn chuyển sang màn hình tải video mới?')) {
-      return;
-    }
-  }
-
+  isProcessing = false;
   resetWorkspaceToNoJob();
   showToast('Workspace đã sẵn sàng cho video mới.');
 }
