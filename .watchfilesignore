@@ -1,0 +1,11 @@
+data/
+data/**
+scratch/
+scratch/**
+frontend/
+frontend/**
+*.mp4
+*.wav
+*.mp3
+*.srt
+*.json

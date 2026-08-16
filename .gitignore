@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment & Sensitive Credentials
+.env
+.credentials.enc
+data/.credentials.enc
+*.enc
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Processing Runtime Data & Outputs
+data/*
+!data/.gitkeep
+!data/jobs/
+data/jobs/*
+!data/jobs/.gitkeep
+data/batches/*
+data/temp_preview/*
+data/test_48khz_run/*
+
+# Scratch Test Scripts & Temporary Files
+scratch/
+
+# Logs & OS artifacts
+*.log
+.DS_Store
+Thumbs.db

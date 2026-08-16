@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI DUBBING STUDIO - Tách giọng, Dịch thuật & Lồng tiếng AI</title>
+  <meta name="description" content="AI DUBBING STUDIO - Nền tảng chuyên nghiệp tách giọng, nhận diện STT, dịch thuật ngữ cảnh và lồng tiếng AI chất lượng cao.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Montserrat:wght@500;700;800&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Header Bar -->
+    <header class="top-header">
+      <div class="brand-section">
+        <div class="brand-logo-icon">🎙️</div>
+        <div class="brand-text">
+          <h1>AI DUBBING STUDIO</h1>
+          <p>Tách giọng - Dịch thuật - Lồng tiếng AI (Batch 5 Video & Live Subtitle Preview)</p>
+        </div>
+      </div>
+
+      <!-- Pipeline Step Pills (NO_JOB initial state: all pending) -->
+      <div class="pipeline-pills-row">
+        <div class="pill-step" id="stepUpload">
+          <span class="icon-check">○</span>
+          <span>1 Upload Video</span>
+        </div>
+        <div class="pill-step" id="stepExtract">
+          <span class="icon-check">○</span>
+          <span>2 Tách & Trích xuất</span>
+        </div>
+        <div class="pill-step" id="stepWhisper">
+          <span class="icon-check">○</span>
+          <span>3 Whisper STT</span>
+        </div>
+        <div class="pill-step" id="stepTranslate">
+          <span class="icon-check">○</span>
+          <span>4 Dịch thuật AI</span>
+        </div>
+        <div class="pill-step" id="stepTTS">
+          <span class="icon-check">○</span>
+          <span>5 AI Voice TTS</span>
+        </div>
+        <div class="pill-step" id="stepRender">
+          <span class="icon-check">○</span>
+          <span>6 Render Video</span>
+        </div>
+      </div>
+
+      <!-- Top Action Toolbar -->
+      <div class="header-actions">
+        <button type="button" class="btn-ghost-dark header-btn" id="btnOpenHistory">
+          <span>📋</span> Lịch sử tác vụ
+        </button>
+        <button type="button" class="btn-ghost-dark header-btn" id="btnHeaderNewVideo">
+          <span>➕</span> Video mới
+        </button>
+      </div>
+    </header>
+
+    <!-- System Status Banner -->
+    <div class="system-alert-banner" id="systemAlert">
+      <span class="status-icon">⚡</span>
+      <span id="systemAlertText">Hệ thống sẵn sàng: FFmpeg, Faster-Whisper, Gemini AI, Edge-TTS & ASS Subtitle Engine đã kích hoạt.</span>
+    </div>
+
+    <!-- Batch Queue Bar (Phase 3: Multi-Video Selector) -->
+    <div class="batch-queue-bar" id="batchQueueBar" style="display: none;">
+      <div class="queue-bar-header">
+        <div class="queue-title-row">
+          <span class="queue-icon">🎞️</span>
+          <strong>HÀNG ĐỢI XỬ LÝ VIDEO (BATCH QUEUE)</strong>
+          <span class="queue-count-badge" id="queueCountBadge">0/5 video</span>
+        </div>
+        <div class="queue-progress-summary" id="queueProgressSummary">
+          Tiến độ batch: <span id="queueTotalProgress">0%</span>
+        </div>
+      </div>
+      <div class="queue-pills-list" id="queuePillsList">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+    <!-- 3-Column Studio Workspace -->
+    <main class="studio-workspace">
+      <!-- ================= LEFT COLUMN ================= -->
+      <section class="sidebar-col">
+        <!-- Card 1: Quy trình xử lý -->
+        <div class="studio-card" id="processCard">
+          <div class="card-heading">
+            <span>QUY TRÌNH XỬ LÝ</span>
+          </div>
+
+          <div class="stepper-list">
+            <div class="stepper-item" id="stepperItem1">
+              <div class="stepper-item-left">
+                <div class="step-num-badge">1</div>
+                <div class="stepper-text-box">
+                  <h4>Tách giọng & trích xuất âm thanh</h4>
+                  <p>Tách vocal và nhạc nền từ video</p>
+                </div>
+              </div>
+              <span class="step-status-icon" id="stepperCheck1">○</span>
+            </div>
+
+            <div class="stepper-item" id="stepperItem2">
+              <div class="stepper-item-left">
+                <div class="step-num-badge">2</div>
+                <div class="stepper-text-box">
+                  <h4>Nhận dạng giọng nói (Whisper)</h4>
+                  <p>Chuyển giọng nói thành văn bản</p>
+                </div>
+              </div>
+              <span class="step-status-icon" id="stepperCheck2">○</span>
+            </div>
+
+            <div class="stepper-item" id="stepperItem3">
+              <div class="stepper-item-left">
+                <div class="step-num-badge">3</div>
+                <div class="stepper-text-box">
+                  <h4>Dịch thuật AI (Gemini)</h4>
+                  <p>Dịch nội dung sang ngôn ngữ mục tiêu</p>
+                </div>
+              </div>
+              <span class="step-status-icon" id="stepperCheck3">○</span>
+            </div>
+
+            <div class="stepper-item" id="stepperItem4">
+              <div class="stepper-item-left">
+                <div class="step-num-badge">4</div>
+                <div class="stepper-text-box">
+                  <h4>Giọng đọc AI (TTS)</h4>
+                  <p>Tạo giọng đọc tự nhiên</p>
+                </div>
+              </div>
+              <span class="step-status-icon" id="stepperCheck4">○</span>
+            </div>
+
+            <div class="stepper-item" id="stepperItem5">
+              <div class="stepper-item-left">
+                <div class="step-num-badge">5</div>
+                <div class="stepper-text-box">
+                  <h4>Đồng bộ & Lồng tiếng</h4>
+                  <p>Đồng bộ giọng đọc với video gốc</p>
+                </div>
+              </div>
+              <span class="step-status-icon" id="stepperCheck5">○</span>
+            </div>
+
+            <div class="stepper-item" id="stepperItem6">
+              <div class="stepper-item-left">
+                <div class="step-num-badge">6</div>
+                <div class="stepper-text-box">
+                  <h4>Xuất video hoàn chỉnh</h4>
+                  <p>Render video với giọng AI và phụ đề ASS</p>
+                </div>
+              </div>
+              <span class="step-status-icon" id="stepperCheck6">○</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 2: Cấu hình dịch thuật -->
+        <div class="studio-card" id="translateConfigCard">
+          <div class="card-heading">
+            <span>CẤU HÌNH DỊCH THUẬT</span>
+          </div>
+
+          <div class="form-row-2" style="margin-bottom: 0.65rem;">
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="sourceLangSelect">Ngôn ngữ nguồn</label>
+              <select id="sourceLangSelect" class="form-select">
+                <option value="auto" selected>Tự động (Nhận diện)</option>
+                <option value="en">Tiếng Anh (English)</option>
+                <option value="vi">Tiếng Việt (Vietnamese)</option>
+                <option value="zh">Tiếng Trung (Chinese)</option>
+                <option value="ja">Tiếng Nhật (Japanese)</option>
+                <option value="ko">Tiếng Hàn (Korean)</option>
+              </select>
+            </div>
+
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="targetLangSelect">Ngôn ngữ đích</label>
+              <select id="targetLangSelect" class="form-select">
+                <option value="vi" selected>🇻🇳 Tiếng Việt (Vietnamese)</option>
+                <option value="en">🇬🇧 English (Tiếng Anh)</option>
+                <option value="zh">🇨🇳 中文 (Tiếng Trung)</option>
+                <option value="ja">🇯🇵 日本語 (Tiếng Nhật)</option>
+                <option value="ko">🇰🇷 한국어 (Tiếng Hàn)</option>
+                <option value="fr">🇫🇷 Français (Tiếng Pháp)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 0.65rem;">
+            <label class="form-label" for="translationStyleSelect">Phong cách dịch thuật</label>
+            <select id="translationStyleSelect" class="form-select">
+              <option value="movie_review_spoken_vi" selected>🎬 Review phim (TikTok) - Nhanh, cuốn hút, kịch tính, súc tích</option>
+              <option value="standard_dubbing">🌐 Lồng tiếng chuẩn mực (Tự nhiên & Chuẩn âm điệu)</option>
+              <option value="natural_commentary">🎙️ Thuyết minh tự nhiên (Commentary / Vlog / Game)</option>
+            </select>
+          </div>
+
+          <!-- Collapsible API Key Management (Persistent & Secure) -->
+          <div class="gemini-key-container" style="margin-top: 0.2rem;">
+            <!-- Khi đã cấu hình key -->
+            <div class="gemini-key-status-box" id="geminiKeyStatusBox" style="display: flex; align-items: center; justify-content: space-between; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius-sm); padding: 0.35rem 0.6rem;">
+              <div style="display: flex; align-items: center; gap: 0.4rem; font-size: 0.72rem;">
+                <span style="color: var(--emerald-400); font-weight: bold;">●</span>
+                <span id="geminiStatusText" style="color: var(--emerald-400); font-weight: 600;">Gemini API: Đã cấu hình</span>
+                <span style="color: var(--text-dim); letter-spacing: 1px; font-family: monospace;">••••••••••••</span>
+              </div>
+              <div style="display: flex; gap: 0.3rem;">
+                <button type="button" class="btn-text-dim" id="btnChangeGeminiKey" style="font-size: 0.68rem; color: #38bdf8;">Thay đổi</button>
+                <button type="button" class="btn-text-dim" id="btnDeleteGeminiKey" style="font-size: 0.68rem; color: #f87171;">Xóa</button>
+              </div>
+            </div>
+
+            <!-- Khi chưa cấu hình hoặc muốn nhập key mới -->
+            <div class="gemini-key-input-box" id="geminiKeyInputBox" style="display: none;">
+              <div style="display: flex; gap: 0.35rem;">
+                <input type="password" id="geminiApiKeyInput" class="form-input" style="font-size: 0.72rem; padding: 0.35rem 0.5rem; flex: 1;" placeholder="Nhập Gemini API Key (AIza...)">
+                <button type="button" class="btn-primary-purple btn-small" id="btnSaveGeminiKey" style="white-space: nowrap; padding: 0.35rem 0.65rem;">Lưu Key</button>
+                <button type="button" class="btn-ghost-dark btn-small" id="btnCancelGeminiKey" style="display: none; padding: 0.35rem 0.5rem;">Hủy</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 3: Cấu hình giọng đọc AI -->
+        <div class="studio-card" id="dubConfigCard">
+          <div class="card-heading">
+            <span>CẤU HÌNH GIỌNG ĐỌC AI</span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="voiceSelect">Chọn giọng đọc AI</label>
+            <select id="voiceSelect" class="form-select">
+              <optgroup label="🎬 Review Phim / TikTok">
+                <option value="vi-VN-NamMinhNeural_tiktok_review" selected>Nam Minh - Review Phim TikTok (Kịch Tính)</option>
+                <option value="vi-VN-HoaiMyNeural_tiktok_review">Hoài My - Review Phim TikTok (Kịch Tính)</option>
+                <option value="vi-VN-HoaiMyNeural_tiktok_fast">Hoài My - Review Phim Nhịp Nhanh Cuốn Hút</option>
+                <option value="vi-VN-NamMinhNeural_tiktok_fast">Nam Minh - Review Phim Tốc Độ & Lôi Cuốn</option>
+              </optgroup>
+              <optgroup label="🎙️ Truyền Cảm & Kể Chuyện">
+                <option value="vi-VN-HoaiMyNeural">Hoài My (Nữ - Truyền cảm & Tự nhiên)</option>
+                <option value="vi-VN-HoaiMyNeural_story">Hoài My (Nữ - Thuyết minh & Kể chuyện)</option>
+                <option value="vi-VN-NamMinhNeural">Nam Minh (Nam - Trầm ấm & Tiêu chuẩn)</option>
+                <option value="vi-VN-NamMinhNeural_deep">Nam Minh (Nam - Trầm sâu / Phim tài liệu)</option>
+              </optgroup>
+              <optgroup label="⚡ Vlog & Thời Sự">
+                <option value="vi-VN-HoaiMyNeural_young">Hoài My (Nữ - Trẻ trung & Vlog)</option>
+                <option value="vi-VN-NamMinhNeural_news">Nam Minh (Nam - Thời sự & Dứt khoát)</option>
+                <option value="vi-VN-NamMinhNeural_fast">Nam Minh (Nam - Review Game & Năng động)</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <!-- Sliders -->
+          <div class="slider-group">
+            <div class="slider-row">
+              <div class="slider-label-row">
+                <span>Tốc độ đọc (Speed)</span>
+                <span class="slider-badge" id="speedRateValue">+15%</span>
+              </div>
+              <input type="range" id="speedRateRange" class="range-input" min="-20" max="50" step="5" value="15">
+            </div>
+
+            <div class="slider-row">
+              <div class="slider-label-row">
+                <span>Cao độ giọng (Pitch)</span>
+                <span class="slider-badge" id="pitchValue">+2Hz</span>
+              </div>
+              <input type="range" id="pitchRange" class="range-input" min="-10" max="10" step="1" value="2">
+            </div>
+
+            <div class="slider-row">
+              <div class="slider-label-row">
+                <span>Âm lượng giọng AI</span>
+                <span class="slider-badge" id="voiceVolumeValue">120%</span>
+              </div>
+              <input type="range" id="voiceVolumeRange" class="range-input" min="20" max="200" step="5" value="120">
+            </div>
+
+            <div class="slider-row">
+              <div class="slider-label-row">
+                <span>Âm lượng nhạc nền</span>
+                <span class="slider-badge" id="bgVolumeValue">15%</span>
+              </div>
+              <input type="range" id="bgVolumeRange" class="range-input" min="0" max="100" step="5" value="15">
+            </div>
+          </div>
+
+          <div style="display: none;">
+            <input type="checkbox" id="keepBgAudioCheckbox" checked>
+          </div>
+
+          <!-- Buttons Row -->
+          <div style="display: flex; gap: 0.5rem;">
+            <button type="button" class="btn-primary-purple" id="previewVoiceBtn">
+              <span>✨</span> Nghe thử giọng này
+            </button>
+            <button type="button" class="btn-ghost-dark" id="resetConfigBtn">
+              <span>🔄</span> Đặt lại cấu hình
+            </button>
+          </div>
+        </div>
+
+        <!-- Card 4: Phong cách phụ đề (Subtitle Style & Direct Manipulation) -->
+        <div class="studio-card" id="subtitleStyleCard">
+          <div class="card-heading" style="display: flex; justify-content: space-between; align-items: center;">
+            <span>PHONG CÁCH PHỤ ĐỀ (ASS STYLE)</span>
+            <button type="button" id="resetSubStyleBtn" class="btn-text-dim" style="font-size: 0.7rem;">Mặc định</button>
+          </div>
+
+          <div style="font-size: 0.72rem; color: var(--accent-cyan); background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 6px; padding: 0.35rem 0.55rem; margin-bottom: 0.6rem; display: flex; align-items: center; gap: 0.35rem;">
+            <span>💡</span>
+            <span>Kéo thả & phóng to/thu nhỏ vị trí phụ đề trực tiếp trên video.</span>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 0.5rem;">
+            <label class="form-label" for="subFontFamily">Font chữ</label>
+            <select id="subFontFamily" class="form-select">
+              <option value="Arial" selected>Arial (Chuẩn)</option>
+              <option value="Montserrat">Montserrat (Đậm nét)</option>
+              <option value="Roboto">Roboto (Hiện đại)</option>
+              <option value="Inter">Inter (Studio)</option>
+              <option value="Tahoma">Tahoma (Dễ đọc)</option>
+              <option value="Times New Roman">Times New Roman</option>
+            </select>
+          </div>
+
+          <!-- Colors & Size Row -->
+          <div class="form-row-3" style="margin-bottom: 0.5rem; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.4rem;">
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="subTextColor">Màu chữ</label>
+              <div class="color-picker-wrapper">
+                <input type="color" id="subTextColor" value="#ffffff" class="color-input">
+                <span class="color-hex-label" id="subTextColorLabel">#FFFFFF</span>
+              </div>
+            </div>
+
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="subOutlineColor">Màu viền</label>
+              <div class="color-picker-wrapper">
+                <input type="color" id="subOutlineColor" value="#000000" class="color-input">
+                <span class="color-hex-label" id="subOutlineColorLabel">#000000</span>
+              </div>
+            </div>
+
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="subFontSize">Cỡ chữ (px)</label>
+              <input type="number" id="subFontSize" class="form-input" min="18" max="72" value="36" style="padding: 0.35rem 0.4rem;">
+            </div>
+          </div>
+
+          <!-- Sliders Outline -->
+          <div class="slider-group" style="margin-top: 0.3rem;">
+            <div class="slider-row">
+              <div class="slider-label-row">
+                <span>Độ dày viền (Stroke)</span>
+                <span class="slider-badge" id="subOutlineWidthValue">2.5px</span>
+              </div>
+              <input type="range" id="subOutlineWidth" class="range-input" min="0" max="8" step="0.5" value="2.5">
+            </div>
+          </div>
+
+          <div style="display: flex; gap: 1rem; margin-top: 0.4rem;">
+            <label class="option-checkbox-label" for="subBoldCheckbox" style="font-size: 0.72rem;">
+              <input type="checkbox" id="subBoldCheckbox" checked>
+              <span>Chữ in đậm (Bold)</span>
+            </label>
+            <label class="option-checkbox-label" for="subShadowCheckbox" style="font-size: 0.72rem;">
+              <input type="checkbox" id="subShadowCheckbox" checked>
+              <span>Đổ bóng (Drop Shadow)</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Card 5: Tùy chọn xử lý (Pipeline Options) -->
+        <div class="studio-card" id="optionsCard">
+          <div class="card-heading">
+            <span>TÙY CHỌN XỬ LÝ</span>
+          </div>
+
+          <div class="options-list">
+            <div class="option-checkbox-row">
+              <label class="option-checkbox-label" for="optSTT">
+                <input type="checkbox" id="optSTT" checked>
+                <span>Nhận dạng giọng nói — Whisper STT</span>
+              </label>
+              <span class="option-badge-req">Cơ bản</span>
+            </div>
+
+            <!-- Sub-panel Whisper Model Selector -->
+            <div class="sub-option-box" id="whisperModelSubOption" style="margin: -0.2rem 0 0.45rem 1.6rem; display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+              <label for="whisperModelSelect" style="font-size: 0.72rem; color: var(--text-muted); white-space: nowrap;">Model Whisper:</label>
+              <select id="whisperModelSelect" class="form-select" style="font-size: 0.72rem; padding: 0.25rem 0.5rem; max-width: 140px;">
+                <option value="tiny">tiny (Siêu nhanh)</option>
+                <option value="base">base (Nhanh)</option>
+                <option value="small" selected>small (Chuẩn)</option>
+                <option value="medium">medium (Chính xác cao)</option>
+                <option value="large-v3">large-v3 (Tối đa)</option>
+              </select>
+            </div>
+
+            <div class="option-checkbox-row">
+              <label class="option-checkbox-label" for="optTranslate">
+                <input type="checkbox" id="optTranslate" checked>
+                <span>Dịch thuật ngữ cảnh — Gemini AI</span>
+              </label>
+              <span class="option-badge-req">AI</span>
+            </div>
+
+            <div class="option-checkbox-row">
+              <label class="option-checkbox-label" for="optTTS">
+                <input type="checkbox" id="optTTS" checked>
+                <span>Tạo giọng đọc AI — Edge-TTS</span>
+              </label>
+              <span class="option-badge-req">Voice</span>
+            </div>
+
+            <!-- Subtitle Primary Option + Mode Selector (Requirements 15, 16, 17) -->
+            <div class="option-checkbox-row">
+              <label class="option-checkbox-label" for="optSubtitle">
+                <input type="checkbox" id="optSubtitle" checked>
+                <span>Phụ đề (Subtitles)</span>
+              </label>
+              <span class="option-badge-req">ASS/SRT</span>
+            </div>
+
+            <div class="sub-option-box" id="subModeSubOption" style="margin: -0.2rem 0 0.45rem 1.6rem; display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+              <label for="subModeSelect" style="font-size: 0.72rem; color: var(--text-muted); white-space: nowrap;">Chế độ phụ đề:</label>
+              <select id="subModeSelect" class="form-select" style="font-size: 0.72rem; padding: 0.25rem 0.5rem; max-width: 180px;">
+                <option value="burn" selected>🎬 Ghép cứng vào video (Burn-in)</option>
+                <option value="external">📄 Chỉ xuất file SRT (External)</option>
+              </select>
+            </div>
+
+            <div class="option-checkbox-row">
+              <label class="option-checkbox-label" for="optRender">
+                <input type="checkbox" id="optRender" checked>
+                <span>Render video hoàn chỉnh</span>
+              </label>
+              <span class="option-badge-req">MP4</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card 6: Xuất video & Nút xử lý duy nhất -->
+        <div class="studio-card">
+          <div class="card-heading">
+            <span>XUẤT VIDEO HOÀN CHỈNH</span>
+          </div>
+
+          <div class="form-row-2" style="margin-bottom: 0.75rem;">
+            <select class="form-select" id="resolutionSelect">
+              <option value="1080p" selected>1080p (Full HD)</option>
+              <option value="720p">720p (HD)</option>
+              <option value="original">Gốc (Original)</option>
+            </select>
+            <select class="form-select" id="formatSelect">
+              <option value="mp4" selected>MP4 (H.264 + AAC)</option>
+              <option value="mkv">MKV (H.264 + AAC)</option>
+            </select>
+          </div>
+
+          <!-- PRIMARY CTA BUTTON DUY NHẤT -->
+          <button id="runPipelineBtn" class="btn-primary-green btn-disabled" disabled>
+            <span>🚀</span> BẮT ĐẦU XỬ LÝ
+          </button>
+        </div>
+      </section>
+
+      <!-- ================= CENTER COLUMN ================= -->
+      <section class="center-col">
+        <!-- Card: Xem video & Live Subtitle Overlay -->
+        <div class="studio-card" id="videoCard">
+          <div class="card-heading">
+            <span>XEM VIDEO</span>
+          </div>
+
+          <!-- Video Metadata Pills (Initial Empty State) -->
+          <div class="video-meta-pills-bar">
+            <span class="video-pill" id="videoBadgeName">🎬 Chưa có video</span>
+            <span class="video-pill" id="videoBadgeRes">🔲 —</span>
+            <span class="video-pill" id="videoBadgeDuration">⏱ —</span>
+            <span class="video-pill" id="videoBadgeFps">🎬 —</span>
+          </div>
+
+          <!-- Video Player Frame + Live Subtitle Overlay (Phase 6) -->
+          <div class="video-player-frame" id="videoFrameWrapper">
+            <video id="videoPreview" class="main-video-element" controls></video>
+            
+            <!-- Live Real-Time Subtitle DOM Overlay -->
+            <div class="subtitle-live-overlay" id="subtitleLiveOverlay"></div>
+
+            <!-- Dropzone Overlay for Easy Drag & Drop (Supports 1-5 videos) -->
+            <div class="video-drop-overlay" id="dropzone">
+              <div class="drop-icon-large">🎬</div>
+              <div class="drop-title">Kéo & thả video vào đây (1–5 video)</div>
+              <div class="drop-subtitle">Hỗ trợ tải lên cùng lúc tối đa 5 file (MP4, MOV, MKV, WEBM - Tối đa 500MB)</div>
+              <button type="button" class="btn-ghost-dark" id="selectBtn" style="margin-top: 0.4rem;">
+                Chọn file video
+              </button>
+            </div>
+            <input type="file" id="fileInput" style="display: none;" accept=".mp4,.mov,.mkv,.webm" multiple>
+          </div>
+
+          <!-- Realtime Progress Bar -->
+          <div class="global-progress-box" id="progressBox">
+            <div class="progress-info-row">
+              <span id="progressStatus">Đang xử lý...</span>
+              <span id="progressPercent" style="font-weight: 700; color: var(--emerald-400);">0%</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill-bar" id="progressBarFill"></div>
+            </div>
+          </div>
+
+          <!-- Retry Banner (Phase 1: Item-Level Retry & Resume) -->
+          <div class="retry-action-box" id="retryActionBox" style="display: none;">
+            <div class="retry-info">
+              <span class="retry-icon">⚠️</span>
+              <div class="retry-text">
+                <strong id="retryErrorMessage">Tác vụ bị lỗi</strong>
+                <p>Bạn có thể thử lại từ đoạn bị lỗi (các bước đã xong sẽ được tái sử dụng 100%) hoặc chạy lại từ đầu.</p>
+              </div>
+            </div>
+            <div class="retry-buttons-row">
+              <button type="button" class="btn-primary-purple btn-small" id="btnRetryFailed">
+                <span>🔄</span> Thử lại từ đoạn lỗi
+              </button>
+              <button type="button" class="btn-ghost-dark btn-small" id="btnRerunAll">
+                <span>🔁</span> Chạy lại toàn bộ
+              </button>
+            </div>
+          </div>
+
+          <!-- Section: Thông tin video (Initial Empty State) -->
+          <div style="margin-top: 0.85rem;">
+            <div class="card-heading" style="margin-bottom: 0.35rem;">
+              <span>THÔNG TIN VIDEO</span>
+            </div>
+
+            <div class="video-info-grid">
+              <div class="info-item">
+                <span class="label">Tên file:</span>
+                <span class="val" id="videoName">—</span>
+              </div>
+              <div class="info-item">
+                <span class="label">Định dạng:</span>
+                <span class="val" id="videoFormat">—</span>
+              </div>
+              <div class="info-item">
+                <span class="label">Thời lượng:</span>
+                <span class="val" id="videoDuration">—</span>
+              </div>
+              <div class="info-item">
+                <span class="label">FPS:</span>
+                <span class="val" id="videoFps">—</span>
+              </div>
+              <div class="info-item">
+                <span class="label">Độ phân giải:</span>
+                <span class="val" id="videoResolution">—</span>
+              </div>
+              <div class="info-item">
+                <span class="label">Tỷ lệ:</span>
+                <span class="val" id="videoRatio">—</span>
+              </div>
+              <div class="info-item">
+                <span class="label">Dung lượng:</span>
+                <span class="val" id="videoSize">—</span>
+              </div>
+              <div class="info-item">
+                <span class="label">Ngày tải lên:</span>
+                <span class="val" id="videoUploadDate">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Card: Nhật ký xử lý (Log) (Initial Empty State) -->
+        <div class="studio-card" id="logCard">
+          <div class="card-heading">
+            <span>NHẬT KÝ XỬ LÝ (LOG)</span>
+          </div>
+
+          <div class="log-table-container">
+            <table class="log-table">
+              <tbody id="logTableBody">
+                <tr>
+                  <td colspan="3" style="text-align: center; color: var(--text-dim); padding: 1.5rem 0.5rem; font-size: 0.74rem;">
+                    Chưa có tác vụ xử lý. Hãy tải video lên để bắt đầu.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= RIGHT COLUMN ================= -->
+      <section class="right-col">
+        <!-- Card: Dịch & Phụ đề (Initial Empty State) -->
+        <div class="studio-card" id="transcriptCard">
+          <div class="card-heading">
+            <span>DỊCH & PHỤ ĐỀ</span>
+          </div>
+
+          <!-- Top Toolbar -->
+          <div class="sub-toolbar">
+            <button type="button" class="btn-sub-action btn-disabled" id="downloadOriginalSrtBtn" disabled>
+              <span>📥</span> Tải phụ đề gốc (SRT)
+            </button>
+            <button type="button" class="btn-sub-action green-border btn-disabled" id="downloadTranslatedSrtBtn" disabled>
+              <span>📥</span> Tải phụ đề dịch (SRT)
+            </button>
+            <button type="button" class="btn-sub-action" id="refreshSubsBtn">
+              <span>🔄</span> Làm mới
+            </button>
+          </div>
+
+          <!-- Tabs -->
+          <div class="sub-tabs-row">
+            <button type="button" class="sub-tab-btn" id="tabOriginal">Original</button>
+            <button type="button" class="sub-tab-btn active" id="tabTranslated">Đã dịch</button>
+          </div>
+
+          <!-- Search & Auto Scroll -->
+          <div class="sub-search-row">
+            <label class="auto-scroll-label">
+              <input type="checkbox" id="autoScrollCheckbox" checked>
+              <span>Tự động cuộn đồng bộ</span>
+            </label>
+            <input type="text" id="subSearchInput" class="search-input-sub" placeholder="🔍 Tìm kiếm nội dung...">
+          </div>
+
+          <!-- Subtitle List Container (Initial Empty State) -->
+          <div class="sub-table-container" id="transcriptList">
+            <div class="empty-state-box" id="subEmptyState">
+              <div class="empty-icon">📝</div>
+              <div class="empty-title">Chưa có phụ đề</div>
+              <div class="empty-desc">Phụ đề sẽ xuất hiện sau khi hoàn thành Whisper STT và Dịch thuật AI.</div>
+            </div>
+          </div>
+
+          <!-- Subtitle Footer Summary -->
+          <div class="sub-summary-footer">
+            <span>Tổng số dòng: <strong id="totalSubsCount">0</strong></span>
+            <span>CPS trung bình: <strong id="avgCpsCount">—</strong></span>
+            <span>Tối đa CPS: <strong id="maxCpsCount">—</strong></span>
+          </div>
+        </div>
+
+        <!-- Card: Video hoàn chỉnh & Batch Results (Phase 4 & 8) -->
+        <div class="studio-card" id="finalVideoCard">
+          <div class="card-heading" style="display: flex; justify-content: space-between; align-items: center;">
+            <span>VIDEO HOÀN CHỈNH</span>
+            <span style="font-size: 0.72rem; color: var(--text-dim); font-weight: 600;" id="finalVideoStatusBadge">⚪ Chờ xử lý</span>
+          </div>
+
+          <!-- Empty State Container when no completed video -->
+          <div class="empty-state-box" id="finalVideoEmpty">
+            <div class="empty-icon">🎬</div>
+            <div class="empty-title">Chưa có video hoàn chỉnh</div>
+            <div class="empty-desc">Video sau khi lồng tiếng AI và render sẽ xuất hiện tại đây.</div>
+          </div>
+
+          <!-- Content container: only shown after successful render -->
+          <div class="final-video-card-body" id="finalVideoContent" style="display: none;">
+            <div class="final-thumb-wrapper">
+              <video id="finalVideoPlayer" class="final-video-elem" controls></video>
+              <div class="thumb-dur-badge" id="finalThumbDuration">00:00</div>
+            </div>
+
+            <div class="final-meta-list">
+              <div class="final-meta-title" id="finalVideoName">—</div>
+              <div class="final-meta-item">
+                <span>Độ phân giải:</span>
+                <span id="finalVideoRes">—</span>
+              </div>
+              <div class="final-meta-item">
+                <span>Định dạng:</span>
+                <span id="finalVideoFormat">—</span>
+              </div>
+              <div class="final-meta-item">
+                <span>Dung lượng:</span>
+                <span id="finalVideoSize">—</span>
+              </div>
+              <div class="final-meta-item">
+                <span>Thời lượng:</span>
+                <span id="finalVideoDuration">—</span>
+              </div>
+              <div class="final-meta-item">
+                <span>Ngày hoàn tất:</span>
+                <span id="finalVideoDate">—</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Big Green Download Button -->
+          <a id="downloadVideoBtn" class="btn-primary-green btn-disabled" href="#" download style="text-decoration: none; margin-top: 0.5rem;" aria-disabled="true">
+            <span>⬇</span> Tải video (MP4)
+          </a>
+
+          <!-- Actions Row -->
+          <div class="final-actions-row">
+            <a id="downloadSrtBtn" class="btn-action-small btn-disabled" href="#" download aria-disabled="true">
+              <span>📄</span> Tải phụ đề (SRT)
+            </a>
+            <button type="button" class="btn-action-small" id="btnNewVideo">
+              <span>➕</span> Xử lý video khác
+            </button>
+          </div>
+
+          <!-- Batch Results List (Phase 8: Individual Cards for all batch items) -->
+          <div class="batch-results-wrapper" id="batchResultsWrapper" style="display: none; margin-top: 0.8rem;">
+            <div class="card-heading" style="font-size: 0.72rem; margin-bottom: 0.4rem;">
+              <span>KẾT QUẢ DANH SÁCH BATCH</span>
+            </div>
+            <div class="batch-results-list" id="batchResultsList">
+              <!-- Rendered dynamically -->
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Job History Slide-over Drawer (Phase 2) -->
+  <div class="history-drawer-backdrop" id="historyDrawerBackdrop"></div>
+  <aside class="history-drawer" id="historyDrawer">
+    <div class="drawer-header">
+      <div class="drawer-title">
+        <span>📋</span> Lịch sử tác vụ (Job History)
+      </div>
+      <button type="button" class="drawer-close-btn" id="btnCloseHistory">✕</button>
+    </div>
+    <div class="drawer-search-row">
+      <input type="text" id="historySearchInput" class="search-input-sub" placeholder="🔍 Tìm theo tên video...">
+    </div>
+    <div class="drawer-body" id="historyListContainer">
+      <div class="empty-state-box">
+        <div class="empty-icon">📁</div>
+        <div class="empty-title">Đang tải lịch sử...</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Main JavaScript -->
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
