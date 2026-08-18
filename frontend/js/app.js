@@ -1,5 +1,8 @@
 import { apiClient } from './api.js';
 
+window.APP_BUILD_ID = "UPLOAD_FIX_2026_08_18_01";
+console.log("[APP_BUILD]", window.APP_BUILD_ID);
+
 // ================= DOM ELEMENTS =================
 // 1. Upload & Video Elements
 const dropzone = document.getElementById('dropzone');
@@ -7,7 +10,12 @@ const fileInput = document.getElementById('fileInput');
 const selectBtn = document.getElementById('selectBtn');
 const videoPreview = document.getElementById('videoPreview');
 const videoFrameWrapper = document.getElementById('videoFrameWrapper');
+const maskCanvasLayer = document.getElementById('maskCanvasLayer');
 const subtitleLiveOverlay = document.getElementById('subtitleLiveOverlay');
+const editorInteractionLayer = document.getElementById('editorInteractionLayer');
+const maskRegionsCard = document.getElementById('maskRegionsCard');
+const addMaskRegionBtn = document.getElementById('addMaskRegionBtn');
+const maskRegionsList = document.getElementById('maskRegionsList');
 
 const videoBadgeName = document.getElementById('videoBadgeName');
 const videoBadgeRes = document.getElementById('videoBadgeRes');
@@ -170,7 +178,9 @@ const systemAlertText = document.getElementById('systemAlertText');
 const toastContainer = document.getElementById('toastContainer');
 
 // ================= APPLICATION CENTRAL STATE =================
+let workspaceGeneration = 0; // Generation token to invalidate stale responses (Section 5)
 let workspaceMode = 'no_job'; // 'no_job' | 'job' | 'batch' (Section 10)
+let isGeminiConfigured = false; // State of Gemini API Key configuration
 let currentJob = null;
 let currentJobId = null;
 let currentBatchId = null;
@@ -190,9 +200,15 @@ let currentOutput = null;
 
 let activeSubtitleTab = 'translated'; // 'original' | 'translated'
 let allHistoryJobs = [];
-let isGeminiConfigured = false;
-let subtitlePosition = { x: 0.50, y: 0.88 }; // Tọa độ tương đối chuẩn hóa (0.0 đến 1.0)
-let workspaceGeneration = 0; // Generation Token chống race condition stale response (Section 5)
+let subtitleLayout = {
+  x: 0.50,
+  y: 0.88,
+  width: 0.70,
+  height: 0.15,
+};
+let subtitlePosition = { x: 0.50, y: 0.88 }; // Backward compatibility alias
+let maskRegions = []; // Array of MaskRegion items
+let selectedObjectId = 'subtitle'; // 'subtitle' | mask.id
 
 // Poller State
 let activePollTimer = null;
@@ -270,6 +286,7 @@ const STAGE_CONFIG = {
 
 // ================= UTILITIES & HELPERS =================
 function showToast(message, type = 'success') {
+  if (!toastContainer) return;
   const toast = document.createElement('div');
   toast.className = `toast ${type === 'error' ? 'error' : ''}`;
   toast.innerHTML = `<span>${type === 'error' ? '❌' : '✓'}</span><span>${message}</span>`;
@@ -277,7 +294,13 @@ function showToast(message, type = 'success') {
   setTimeout(() => {
     toast.style.opacity = '0';
     toast.style.transform = 'translateY(10px)';
-    setTimeout(() => toast.remove(), 300);
+    setTimeout(() => {
+      if (toast && typeof toast.remove === 'function') {
+        toast.remove();
+      } else if (toast && toast.parentNode) {
+        toast.parentNode.removeChild(toast);
+      }
+    }, 300);
   }, 3500);
 }
 
@@ -308,58 +331,81 @@ function formatDurationMs(ms) {
 }
 
 // ================= INITIALIZATION & RESTORE =================
-document.addEventListener('DOMContentLoaded', async () => {
-  initEventListeners();
-  updateSubtitleVisibilityAndPreview();
+async function initApp() {
+  // 1. Critical event listeners & direct manipulation handlers MUST bind first
+  try {
+    initEventListeners();
+    updateSubtitleVisibilityAndPreview();
+  } catch (e) {
+    console.error('[INIT_CRITICAL_LISTENERS_ERROR]', e);
+  }
 
-  // Kiểm tra sức khỏe hệ thống & Gemini API status
+  // 2. Health check (non-blocking)
   try {
     const health = await apiClient.checkHealth();
-    if (health.status === 'healthy') {
-      systemAlertText.textContent = 'Hệ thống sẵn sàng: FFmpeg, Faster-Whisper, Gemini AI, Edge-TTS & ASS Burn-in đã kích hoạt.';
+    if (health && health.status === 'healthy') {
+      if (systemAlertText) systemAlertText.textContent = 'Hệ thống sẵn sàng: FFmpeg, Faster-Whisper, Gemini AI, Edge-TTS & ASS Burn-in đã kích hoạt.';
     } else {
-      systemAlertText.textContent = `Cảnh báo: ${health.message || 'Một số module chưa sẵn sàng'}`;
-      systemAlert.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+      if (systemAlertText) systemAlertText.textContent = `Cảnh báo: ${(health && health.message) || 'Một số module chưa sẵn sàng'}`;
+      if (systemAlert) systemAlert.style.borderColor = 'rgba(239, 68, 68, 0.4)';
     }
   } catch (e) {
     console.warn('Lỗi kiểm tra hệ thống:', e);
   }
 
-  // Tải trạng thái Gemini API Key đã lưu (TEST 36, 37)
-  await loadGeminiStatus();
+  // 3. Optional service status (Gemini API Key) - Non-blocking
+  try {
+    await loadGeminiStatus();
+  } catch (e) {
+    console.warn('Lỗi tải trạng thái Gemini:', e);
+  }
 
-  // Restore Job hoặc Batch sau khi F5 (CASE A: Đang xem Job hợp lệ / CASE B: NO_JOB)
-  const savedWorkspaceMode = localStorage.getItem('workspace_mode');
-  const savedBatchId = localStorage.getItem('last_batch_id');
-  const savedJobId = localStorage.getItem('last_job_id');
+  // 4. Restore Job hoặc Batch sau khi F5 (CASE A: Đang xem Job hợp lệ / CASE B: NO_JOB)
+  try {
+    const savedWorkspaceMode = localStorage.getItem('workspace_mode');
+    const savedBatchId = localStorage.getItem('last_batch_id');
+    const savedJobId = localStorage.getItem('last_job_id');
 
-  if (savedWorkspaceMode === 'no_job') {
-    resetWorkspaceToNoJob();
-  } else if (savedWorkspaceMode === 'batch' && savedBatchId) {
-    await restoreBatchState(savedBatchId);
-  } else if (savedJobId) {
-    await restoreJobState(savedJobId);
-  } else {
+    if (savedWorkspaceMode === 'no_job') {
+      resetWorkspaceToNoJob();
+    } else if (savedWorkspaceMode === 'batch' && savedBatchId) {
+      await restoreBatchState(savedBatchId);
+    } else if (savedJobId) {
+      await restoreJobState(savedJobId);
+    } else {
+      resetWorkspaceToNoJob();
+    }
+  } catch (e) {
+    console.error('[INIT_WORKSPACE_RESTORE_ERROR]', e);
     resetWorkspaceToNoJob();
   }
-});
+}
+
+// Bootstrap on DOM Ready or Immediately if already loaded (Fix for deferred ES Modules)
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
+}
 
 // ================= GEMINI API KEY MANAGEMENT =================
 async function loadGeminiStatus() {
   try {
     const res = await apiClient.getGeminiStatus();
-    isGeminiConfigured = res.configured;
-    if (res.configured) {
-      geminiKeyStatusBox.style.display = 'flex';
-      geminiKeyInputBox.style.display = 'none';
-      geminiStatusText.textContent = 'Gemini API: Đã cấu hình';
-      if (res.source === 'env') {
-        geminiStatusText.textContent = 'Gemini API: Cấu hình qua .env';
+    isGeminiConfigured = Boolean(res && res.configured);
+    if (res && res.configured) {
+      if (geminiKeyStatusBox) geminiKeyStatusBox.style.display = 'flex';
+      if (geminiKeyInputBox) geminiKeyInputBox.style.display = 'none';
+      if (geminiStatusText) {
+        geminiStatusText.textContent = 'Gemini API: Đã cấu hình';
+        if (res.source === 'env') {
+          geminiStatusText.textContent = 'Gemini API: Cấu hình qua .env';
+        }
       }
     } else {
-      geminiKeyStatusBox.style.display = 'none';
-      geminiKeyInputBox.style.display = 'block';
-      btnCancelGeminiKey.style.display = 'none';
+      if (geminiKeyStatusBox) geminiKeyStatusBox.style.display = 'none';
+      if (geminiKeyInputBox) geminiKeyInputBox.style.display = 'block';
+      if (btnCancelGeminiKey) btnCancelGeminiKey.style.display = 'none';
     }
   } catch (e) {
     console.warn('Lỗi kiểm tra trạng thái Gemini:', e);
@@ -404,79 +450,118 @@ async function handleDeleteGeminiKey() {
 // ================= EVENT LISTENERS =================
 function initEventListeners() {
   // Dropzone & File Selection (Hỗ trợ 1-5 file video)
-  selectBtn.addEventListener('click', () => fileInput.click());
-  dropzone.addEventListener('click', (e) => {
-    if (e.target !== selectBtn) fileInput.click();
-  });
-
-  fileInput.addEventListener('change', (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-      handleFilesSelected(Array.from(e.target.files));
-    }
-  });
-
-  ['dragenter', 'dragover'].forEach((eventName) => {
-    dropzone.addEventListener(eventName, (e) => {
-      e.preventDefault();
-      dropzone.classList.add('drag-over');
+  if (selectBtn) {
+    selectBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
     });
-  });
-
-  ['dragleave', 'drop'].forEach((eventName) => {
-    dropzone.addEventListener(eventName, (e) => {
-      e.preventDefault();
-      dropzone.classList.remove('drag-over');
+  }
+  if (dropzone) {
+    dropzone.addEventListener('click', (e) => {
+      if (e.target !== selectBtn && (!selectBtn || !selectBtn.contains(e.target))) {
+        if (fileInput) fileInput.click();
+      }
     });
-  });
 
-  dropzone.addEventListener('drop', (e) => {
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      handleFilesSelected(Array.from(e.dataTransfer.files));
-    }
-  });
+    ['dragenter', 'dragover'].forEach((eventName) => {
+      dropzone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropzone.classList.add('drag-over');
+      });
+    });
+
+    ['dragleave', 'drop'].forEach((eventName) => {
+      dropzone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('drag-over');
+      });
+    });
+
+    dropzone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        try {
+          await handleFilesSelected(Array.from(e.dataTransfer.files));
+        } catch (err) {
+          console.error('[UPLOAD_DROP_ERROR]', err);
+          showToast('Lỗi khi tải file: ' + (err.message || err), 'error');
+        }
+      }
+    });
+  }
+
+  if (fileInput) {
+    fileInput.addEventListener('change', async (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        const files = Array.from(e.target.files);
+        fileInput.value = ''; // Reset input để chọn lại cùng 1 file vẫn trigger change
+        try {
+          await handleFilesSelected(files);
+        } catch (err) {
+          console.error('[UPLOAD_CHANGE_ERROR]', err);
+          showToast('Lỗi khi tải file: ' + (err.message || err), 'error');
+        }
+      }
+    });
+  }
 
   // Slider Badges
-  speedRateRange.addEventListener('input', () => {
-    const val = parseInt(speedRateRange.value);
-    speedRateValue.textContent = val >= 0 ? `+${val}%` : `${val}%`;
-  });
+  if (speedRateRange && speedRateValue) {
+    speedRateRange.addEventListener('input', () => {
+      const val = parseInt(speedRateRange.value);
+      speedRateValue.textContent = val >= 0 ? `+${val}%` : `${val}%`;
+    });
+  }
 
-  pitchRange.addEventListener('input', () => {
-    const val = parseInt(pitchRange.value);
-    pitchValue.textContent = val >= 0 ? `+${val}Hz` : `${val}Hz`;
-  });
+  if (pitchRange && pitchValue) {
+    pitchRange.addEventListener('input', () => {
+      const val = parseInt(pitchRange.value);
+      pitchValue.textContent = val >= 0 ? `+${val}Hz` : `${val}Hz`;
+    });
+  }
 
-  voiceVolumeRange.addEventListener('input', () => {
-    voiceVolumeValue.textContent = `${voiceVolumeRange.value}%`;
-  });
+  if (voiceVolumeRange && voiceVolumeValue) {
+    voiceVolumeRange.addEventListener('input', () => {
+      voiceVolumeValue.textContent = `${voiceVolumeRange.value}%`;
+    });
+  }
 
-  bgVolumeRange.addEventListener('input', () => {
-    bgVolumeValue.textContent = `${bgVolumeRange.value}%`;
-  });
+  if (bgVolumeRange && bgVolumeValue) {
+    bgVolumeRange.addEventListener('input', () => {
+      bgVolumeValue.textContent = `${bgVolumeRange.value}%`;
+    });
+  }
 
   // Gemini API Key Buttons
-  btnSaveGeminiKey.addEventListener('click', handleSaveGeminiKey);
-  btnChangeGeminiKey.addEventListener('click', () => {
-    geminiKeyStatusBox.style.display = 'none';
-    geminiKeyInputBox.style.display = 'block';
-    btnCancelGeminiKey.style.display = 'inline-block';
-    geminiApiKeyInput.focus();
-  });
-  btnCancelGeminiKey.addEventListener('click', () => {
-    geminiKeyInputBox.style.display = 'none';
-    geminiKeyStatusBox.style.display = 'flex';
-    geminiApiKeyInput.value = '';
-  });
-  btnDeleteGeminiKey.addEventListener('click', handleDeleteGeminiKey);
+  if (btnSaveGeminiKey) btnSaveGeminiKey.addEventListener('click', handleSaveGeminiKey);
+  if (btnChangeGeminiKey) {
+    btnChangeGeminiKey.addEventListener('click', () => {
+      if (geminiKeyStatusBox) geminiKeyStatusBox.style.display = 'none';
+      if (geminiKeyInputBox) geminiKeyInputBox.style.display = 'block';
+      if (btnCancelGeminiKey) btnCancelGeminiKey.style.display = 'inline-block';
+      if (geminiApiKeyInput) geminiApiKeyInput.focus();
+    });
+  }
+  if (btnCancelGeminiKey) {
+    btnCancelGeminiKey.addEventListener('click', () => {
+      if (geminiKeyInputBox) geminiKeyInputBox.style.display = 'none';
+      if (geminiKeyStatusBox) geminiKeyStatusBox.style.display = 'flex';
+      if (geminiApiKeyInput) geminiApiKeyInput.value = '';
+    });
+  }
+  if (btnDeleteGeminiKey) btnDeleteGeminiKey.addEventListener('click', handleDeleteGeminiKey);
 
   // Subtitle Toggle & Subtitle Mode (Requirements 15, 16, 17, 18)
-  optSubtitle.addEventListener('change', () => {
-    updateSubtitleVisibilityAndPreview();
-  });
+  if (optSubtitle) {
+    optSubtitle.addEventListener('change', () => {
+      updateSubtitleVisibilityAndPreview();
+    });
+  }
 
-  subModeSelect.addEventListener('change', () => {
-    updateSubtitleVisibilityAndPreview();
-  });
+  if (subModeSelect) {
+    subModeSelect.addEventListener('change', () => {
+      updateSubtitleVisibilityAndPreview();
+    });
+  }
 
   // Subtitle Style Realtime Controls & Live Preview Sync (Requirements 1-4, 20-21)
   [
@@ -490,228 +575,545 @@ function initEventListeners() {
   ].forEach((elem) => {
     if (!elem) return;
     elem.addEventListener('input', () => {
-      if (elem === subTextColor) subTextColorLabel.textContent = subTextColor.value.toUpperCase();
-      if (elem === subOutlineColor) subOutlineColorLabel.textContent = subOutlineColor.value.toUpperCase();
-      if (elem === subOutlineWidth) subOutlineWidthValue.textContent = `${subOutlineWidth.value}px`;
+      if (elem === subTextColor && subTextColorLabel) subTextColorLabel.textContent = subTextColor.value.toUpperCase();
+      if (elem === subOutlineColor && subOutlineColorLabel) subOutlineColorLabel.textContent = subOutlineColor.value.toUpperCase();
+      if (elem === subOutlineWidth && subOutlineWidthValue) subOutlineWidthValue.textContent = `${subOutlineWidth.value}px`;
       updateSubtitleOverlayStyles();
     });
   });
 
-  resetSubStyleBtn.addEventListener('click', () => {
-    subFontFamily.value = 'Arial';
-    subTextColor.value = '#ffffff';
-    subTextColorLabel.textContent = '#FFFFFF';
-    subOutlineColor.value = '#000000';
-    subOutlineColorLabel.textContent = '#000000';
-    subFontSize.value = 36;
-    subOutlineWidth.value = 2.5;
-    subOutlineWidthValue.textContent = '2.5px';
-    subBoldCheckbox.checked = true;
-    subShadowCheckbox.checked = true;
-    subtitlePosition = { x: 0.50, y: 0.88 };
-    updateSubtitleOverlayStyles();
-    showToast('Đã khôi phục style phụ đề mặc định (x=50%, y=88%)');
-  });
+  if (resetSubStyleBtn) {
+    resetSubStyleBtn.addEventListener('click', () => {
+      if (subFontFamily) subFontFamily.value = 'Arial';
+      if (subTextColor) {
+        subTextColor.value = '#ffffff';
+        if (subTextColorLabel) subTextColorLabel.textContent = '#FFFFFF';
+      }
+      if (subOutlineColor) {
+        subOutlineColor.value = '#000000';
+        if (subOutlineColorLabel) subOutlineColorLabel.textContent = '#000000';
+      }
+      if (subFontSize) subFontSize.value = 36;
+      if (subOutlineWidth) {
+        subOutlineWidth.value = 2.5;
+        if (subOutlineWidthValue) subOutlineWidthValue.textContent = '2.5px';
+      }
+      if (subBoldCheckbox) subBoldCheckbox.checked = true;
+      if (subShadowCheckbox) subShadowCheckbox.checked = true;
+      subtitleLayout = { x: 0.50, y: 0.88, width: 0.70, height: 0.15 };
+      subtitlePosition = { x: 0.50, y: 0.88 };
+      renderCanvasOverlays();
+      showToast('Đã khôi phục style phụ đề mặc định (x=50%, y=88%, w=70%, h=15%)');
+    });
+  }
 
   // Synchronize Live Subtitle Overlay on Video Timeupdate
-  videoPreview.addEventListener('timeupdate', () => {
-    updateSubtitleOverlayText();
-  });
+  if (videoPreview) {
+    videoPreview.addEventListener('timeupdate', () => {
+      updateSubtitleOverlayText();
+    });
+  }
 
-  // Khởi tạo các sự kiện kéo thả và phóng to trực tiếp trên video preview
-  initSubtitleDraggableEvents();
+  // Khởi tạo các sự kiện kéo thả & resize trên Video Canvas Editor
+  initCanvasEditorEvents();
 
   // Whisper STT Checkbox dependency
-  optSTT.addEventListener('change', () => {
-    if (optSTT.checked) {
-      whisperModelSelect.disabled = false;
-      whisperModelSubOption.style.opacity = '1';
-      whisperModelSubOption.style.pointerEvents = 'auto';
-    } else {
-      whisperModelSelect.disabled = true;
-      whisperModelSubOption.style.opacity = '0.4';
-      whisperModelSubOption.style.pointerEvents = 'none';
-    }
-  });
+  if (optSTT) {
+    optSTT.addEventListener('change', () => {
+      if (optSTT.checked) {
+        if (whisperModelSelect) whisperModelSelect.disabled = false;
+        if (whisperModelSubOption) {
+          whisperModelSubOption.style.opacity = '1';
+          whisperModelSubOption.style.pointerEvents = 'auto';
+        }
+      } else {
+        if (whisperModelSelect) whisperModelSelect.disabled = true;
+        if (whisperModelSubOption) {
+          whisperModelSubOption.style.opacity = '0.4';
+          whisperModelSubOption.style.pointerEvents = 'none';
+        }
+      }
+    });
+  }
 
   // Voice Preview
-  previewVoiceBtn.addEventListener('click', handlePreviewVoice);
+  if (previewVoiceBtn) previewVoiceBtn.addEventListener('click', handlePreviewVoice);
 
   // Reset Config
-  resetConfigBtn.addEventListener('click', () => {
-    sourceLangSelect.value = 'auto';
-    targetLangSelect.value = 'vi';
-    translationStyleSelect.value = 'movie_review_spoken_vi';
-    voiceSelect.value = 'vi-VN-NamMinhNeural_tiktok_review';
-    speedRateRange.value = 15;
-    speedRateValue.textContent = '+15%';
-    pitchRange.value = 2;
-    pitchValue.textContent = '+2Hz';
-    voiceVolumeRange.value = 120;
-    voiceVolumeValue.textContent = '120%';
-    bgVolumeRange.value = 15;
-    bgVolumeValue.textContent = '15%';
-    showToast('Đã đặt lại cấu hình lồng tiếng');
-  });
+  if (resetConfigBtn) {
+    resetConfigBtn.addEventListener('click', () => {
+      if (sourceLangSelect) sourceLangSelect.value = 'auto';
+      if (targetLangSelect) targetLangSelect.value = 'vi';
+      if (translationStyleSelect) translationStyleSelect.value = 'movie_review_spoken_vi';
+      if (voiceSelect) voiceSelect.value = 'vi-VN-NamMinhNeural_tiktok_review';
+      if (speedRateRange) speedRateRange.value = 15;
+      if (speedRateValue) speedRateValue.textContent = '+15%';
+      if (pitchRange) pitchRange.value = 2;
+      if (pitchValue) pitchValue.textContent = '+2Hz';
+      if (voiceVolumeRange) voiceVolumeRange.value = 120;
+      if (voiceVolumeValue) voiceVolumeValue.textContent = '120%';
+      if (bgVolumeRange) bgVolumeRange.value = 15;
+      if (bgVolumeValue) bgVolumeValue.textContent = '15%';
+      showToast('Đã đặt lại cấu hình lồng tiếng');
+    });
+  }
 
   // Primary Action Button (Unified Run Pipeline)
-  runPipelineBtn.addEventListener('click', handleRunPipeline);
+  if (runPipelineBtn) runPipelineBtn.addEventListener('click', handleRunPipeline);
 
   // Retry Handlers (Phase 1)
-  btnRetryFailed.addEventListener('click', () => handleRetry(true));
-  btnRerunAll.addEventListener('click', () => handleRetry(false));
+  if (btnRetryFailed) btnRetryFailed.addEventListener('click', () => handleRetry(true));
+  if (btnRerunAll) btnRerunAll.addEventListener('click', () => handleRetry(false));
 
   // New Video Workflow (Phase 4)
-  btnNewVideo.addEventListener('click', handleNewVideoWorkflow);
-  btnHeaderNewVideo.addEventListener('click', handleNewVideoWorkflow);
+  if (btnNewVideo) btnNewVideo.addEventListener('click', handleNewVideoWorkflow);
+  if (btnHeaderNewVideo) btnHeaderNewVideo.addEventListener('click', handleNewVideoWorkflow);
 
   // Subtitle Tabs & Search
-  tabOriginal.addEventListener('click', () => {
-    activeSubtitleTab = 'original';
-    tabOriginal.classList.add('active');
-    tabTranslated.classList.remove('active');
-    renderSubtitles();
-  });
+  if (tabOriginal) {
+    tabOriginal.addEventListener('click', () => {
+      activeSubtitleTab = 'original';
+      tabOriginal.classList.add('active');
+      if (tabTranslated) tabTranslated.classList.remove('active');
+      renderSubtitles();
+    });
+  }
 
-  tabTranslated.addEventListener('click', () => {
-    activeSubtitleTab = 'translated';
-    tabTranslated.classList.add('active');
-    tabOriginal.classList.remove('active');
-    renderSubtitles();
-  });
+  if (tabTranslated) {
+    tabTranslated.addEventListener('click', () => {
+      activeSubtitleTab = 'translated';
+      tabTranslated.classList.add('active');
+      if (tabOriginal) tabOriginal.classList.remove('active');
+      renderSubtitles();
+    });
+  }
 
-  subSearchInput.addEventListener('input', () => renderSubtitles());
-  refreshSubsBtn.addEventListener('click', () => {
-    if (currentJobId && workspaceMode === 'job') {
-      const curGen = workspaceGeneration;
-      const targetJobId = currentJobId;
-      apiClient.getJob(targetJobId).then((job) => {
-        if (!canApplyJobPayload(targetJobId, curGen)) return;
-        if (job && job.segments) {
-          currentSegments = job.segments;
-          translatedSegments = job.segments.filter((s) => s.translated_text);
-          subtitleData = job.segments;
-          renderSubtitles();
-          showToast('Đã làm mới danh sách phụ đề');
-        }
-      });
-    }
-  });
+  if (subSearchInput) subSearchInput.addEventListener('input', () => renderSubtitles());
+  if (refreshSubsBtn) {
+    refreshSubsBtn.addEventListener('click', () => {
+      if (currentJobId && workspaceMode === 'job') {
+        const curGen = workspaceGeneration;
+        const targetJobId = currentJobId;
+        apiClient.getJob(targetJobId).then((job) => {
+          if (!canApplyJobPayload(targetJobId, curGen)) return;
+          if (job && job.segments) {
+            currentSegments = job.segments;
+            translatedSegments = job.segments.filter((s) => s.translated_text);
+            subtitleData = job.segments;
+            renderSubtitles();
+            showToast('Đã làm mới danh sách phụ đề');
+          }
+        });
+      }
+    });
+  }
 
   // History Drawer (Phase 2)
-  btnOpenHistory.addEventListener('click', openHistoryDrawer);
-  btnCloseHistory.addEventListener('click', closeHistoryDrawer);
-  historyDrawerBackdrop.addEventListener('click', closeHistoryDrawer);
-  historySearchInput.addEventListener('input', renderHistoryList);
+  if (btnOpenHistory) btnOpenHistory.addEventListener('click', openHistoryDrawer);
+  if (btnCloseHistory) btnCloseHistory.addEventListener('click', closeHistoryDrawer);
+  if (historyDrawerBackdrop) historyDrawerBackdrop.addEventListener('click', closeHistoryDrawer);
+  if (historySearchInput) historySearchInput.addEventListener('input', renderHistoryList);
 }
 
-// ================= DIRECT MANIPULATION SUBTITLE OVERLAY (DRAG & RESIZE) =================
-let isDraggingSub = false;
-let isResizingSub = false;
-let dragStartX = 0;
-let dragStartY = 0;
-let initialSubPosX = 0.50;
-let initialSubPosY = 0.88;
-let initialSubFontSize = 36;
+// ================= DIRECT MANIPULATION CANVAS EDITOR (SUBTITLES & MASK REGIONS) =================
+let activePointerId = null;
+let activeDragMode = null; // 'move' | 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+let activeDragTargetId = null; // 'subtitle' | mask.id
+let dragStartPointerX = 0;
+let dragStartPointerY = 0;
+let initialTargetGeom = { x: 0, y: 0, width: 0, height: 0 };
 
-function initSubtitleDraggableEvents() {
-  if (!subtitleLiveOverlay) return;
+function initCanvasEditorEvents() {
+  if (!editorInteractionLayer) return;
 
-  // Render container nếu chưa có
-  ensureSubtitleOverlayElements();
+  // Add Mask Button
+  if (addMaskRegionBtn) {
+    addMaskRegionBtn.addEventListener('click', () => {
+      addNewMaskRegion();
+    });
+  }
 
-  const box = document.getElementById('subtitleDraggableBox');
-  const resizeHandle = document.getElementById('subtitleResizeHandle');
-  if (!box || !resizeHandle) return;
+  // Pointer Down on Editor Layer (Event delegation for boxes and handles)
+  editorInteractionLayer.addEventListener('pointerdown', (e) => {
+    const handle = e.target.closest('.resize-handle');
+    const box = e.target.closest('.editor-bounding-box');
+    if (!box) return;
 
-  // 1. Drag & Move Subtitle
-  const onMouseDownDrag = (e) => {
-    if (e.target === resizeHandle) return;
-    if (e.button !== 0) return; // Chỉ chuột trái
-    e.preventDefault();
-    isDraggingSub = true;
-    dragStartX = e.clientX;
-    dragStartY = e.clientY;
-    initialSubPosX = subtitlePosition.x;
-    initialSubPosY = subtitlePosition.y;
-    box.classList.add('is-dragging');
+    const targetId = box.dataset.objectId;
+    if (!targetId) return;
 
-    window.addEventListener('mousemove', onMouseMoveDrag);
-    window.addEventListener('mouseup', onMouseUpDrag);
-  };
-
-  const onMouseMoveDrag = (e) => {
-    if (!isDraggingSub) return;
-    const rect = videoFrameWrapper ? videoFrameWrapper.getBoundingClientRect() : { width: 640, height: 360 };
-    const dx = (e.clientX - dragStartX) / Math.max(1, rect.width);
-    const dy = (e.clientY - dragStartY) / Math.max(1, rect.height);
-
-    // Giới hạn trong khung hình (0.06 đến 0.94)
-    subtitlePosition.x = Math.max(0.06, Math.min(0.94, initialSubPosX + dx));
-    subtitlePosition.y = Math.max(0.06, Math.min(0.94, initialSubPosY + dy));
-
-    box.style.left = `${(subtitlePosition.x * 100).toFixed(2)}%`;
-    box.style.top = `${(subtitlePosition.y * 100).toFixed(2)}%`;
-  };
-
-  const onMouseUpDrag = () => {
-    if (isDraggingSub) {
-      isDraggingSub = false;
-      box.classList.remove('is-dragging');
-      window.removeEventListener('mousemove', onMouseMoveDrag);
-      window.removeEventListener('mouseup', onMouseUpDrag);
+    // Check if mask is locked
+    if (targetId.startsWith('mask_')) {
+      const maskObj = maskRegions.find((m) => m.id === targetId);
+      if (maskObj && maskObj.locked) {
+        selectedObjectId = targetId;
+        renderCanvasOverlays();
+        renderMaskRegionsList();
+        return;
+      }
     }
-  };
 
-  box.addEventListener('mousedown', onMouseDownDrag);
-
-  // 2. Resize Handle (Scale font size trực tiếp)
-  const onMouseDownResize = (e) => {
+    e.preventDefault();
     e.stopPropagation();
-    e.preventDefault();
-    isResizingSub = true;
-    dragStartX = e.clientX;
-    dragStartY = e.clientY;
-    initialSubFontSize = parseInt(subFontSize.value) || 36;
-    resizeHandle.classList.add('is-resizing');
 
-    window.addEventListener('mousemove', onMouseMoveResize);
-    window.addEventListener('mouseup', onMouseUpResize);
-  };
+    selectedObjectId = targetId;
+    activePointerId = e.pointerId;
+    dragStartPointerX = e.clientX;
+    dragStartPointerY = e.clientY;
 
-  const onMouseMoveResize = (e) => {
-    if (!isResizingSub) return;
-    const delta = (e.clientX - dragStartX) + (e.clientY - dragStartY);
-    const newSize = Math.max(18, Math.min(72, Math.round(initialSubFontSize + delta * 0.35)));
-    subFontSize.value = newSize;
-    updateSubtitleOverlayStyles();
-  };
-
-  const onMouseUpResize = () => {
-    if (isResizingSub) {
-      isResizingSub = false;
-      resizeHandle.classList.remove('is-resizing');
-      window.removeEventListener('mousemove', onMouseMoveResize);
-      window.removeEventListener('mouseup', onMouseUpResize);
+    if (handle) {
+      activeDragMode = handle.dataset.handle; // 'nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'
+    } else {
+      activeDragMode = 'move';
     }
-  };
 
-  resizeHandle.addEventListener('mousedown', onMouseDownResize);
+    activeDragTargetId = targetId;
+
+    // Store initial geometry
+    if (targetId === 'subtitle') {
+      initialTargetGeom = {
+        x: subtitleLayout.x,
+        y: subtitleLayout.y,
+        width: subtitleLayout.width,
+        height: subtitleLayout.height,
+      };
+    } else {
+      const maskObj = maskRegions.find((m) => m.id === targetId);
+      if (maskObj) {
+        initialTargetGeom = {
+          x: maskObj.x,
+          y: maskObj.y,
+          width: maskObj.width,
+          height: maskObj.height,
+        };
+      }
+    }
+
+    try {
+      editorInteractionLayer.setPointerCapture(e.pointerId);
+    } catch (err) {}
+
+    window.addEventListener('pointermove', onPointerMoveCanvas);
+    window.addEventListener('pointerup', onPointerUpCanvas);
+    window.addEventListener('pointercancel', onPointerUpCanvas);
+
+    renderCanvasOverlays();
+    renderMaskRegionsList();
+  });
 }
 
-function ensureSubtitleOverlayElements() {
-  if (!subtitleLiveOverlay) return;
-  if (!document.getElementById('subtitleDraggableBox')) {
-    subtitleLiveOverlay.innerHTML = `
-      <div class="subtitle-draggable-box" id="subtitleDraggableBox" title="Kéo giữ để di chuyển vị trí phụ đề">
-        <span class="subtitle-text-content" id="subtitleTextContent">Đây là phụ đề</span>
-        <div class="subtitle-resize-handle" id="subtitleResizeHandle" title="Kéo để phóng to/thu nhỏ cỡ chữ"></div>
-      </div>
-    `;
+function onPointerMoveCanvas(e) {
+  if (!activeDragMode || !activeDragTargetId) return;
+
+  const rect = videoFrameWrapper ? videoFrameWrapper.getBoundingClientRect() : { width: 640, height: 360 };
+  const dx = (e.clientX - dragStartPointerX) / Math.max(1, rect.width);
+  const dy = (e.clientY - dragStartPointerY) / Math.max(1, rect.height);
+
+  if (activeDragTargetId === 'subtitle') {
+    // Subtitle object (uses center x, y and normalized width, height)
+    const initW = initialTargetGeom.width;
+    const initH = initialTargetGeom.height;
+    const initL = initialTargetGeom.x - initW / 2;
+    const initT = initialTargetGeom.y - initH / 2;
+    const initR = initL + initW;
+    const initB = initT + initH;
+
+    if (activeDragMode === 'move') {
+      const newX = Math.max(initW / 2, Math.min(1.0 - initW / 2, initialTargetGeom.x + dx));
+      const newY = Math.max(initH / 2, Math.min(1.0 - initH / 2, initialTargetGeom.y + dy));
+      subtitleLayout.x = Math.round(newX * 10000) / 10000;
+      subtitleLayout.y = Math.round(newY * 10000) / 10000;
+      subtitlePosition.x = subtitleLayout.x;
+      subtitlePosition.y = subtitleLayout.y;
+    } else {
+      // 8-point resize handles
+      let newL = initL;
+      let newT = initT;
+      let newR = initR;
+      let newB = initB;
+
+      if (['w', 'nw', 'sw'].includes(activeDragMode)) {
+        newL = Math.max(0.0, Math.min(initR - 0.10, initL + dx));
+      }
+      if (['e', 'ne', 'se'].includes(activeDragMode)) {
+        newR = Math.max(initL + 0.10, Math.min(1.0, initR + dx));
+      }
+      if (['n', 'nw', 'ne'].includes(activeDragMode)) {
+        newT = Math.max(0.0, Math.min(initB - 0.05, initT + dy));
+      }
+      if (['s', 'sw', 'se'].includes(activeDragMode)) {
+        newB = Math.max(initT + 0.05, Math.min(1.0, initB + dy));
+      }
+
+      const newW = Math.max(0.10, newR - newL);
+      const newH = Math.max(0.05, newB - newT);
+      const newX = newL + newW / 2;
+      const newY = newT + newH / 2;
+
+      subtitleLayout.x = Math.round(newX * 10000) / 10000;
+      subtitleLayout.y = Math.round(newY * 10000) / 10000;
+      subtitleLayout.width = Math.round(newW * 10000) / 10000;
+      subtitleLayout.height = Math.round(newH * 10000) / 10000;
+      subtitlePosition.x = subtitleLayout.x;
+      subtitlePosition.y = subtitleLayout.y;
+    }
+  } else {
+    // Mask object (uses top-left x, y and normalized width, height)
+    const maskObj = maskRegions.find((m) => m.id === activeDragTargetId);
+    if (!maskObj || maskObj.locked) return;
+
+    const initW = initialTargetGeom.width;
+    const initH = initialTargetGeom.height;
+    const initL = initialTargetGeom.x;
+    const initT = initialTargetGeom.y;
+    const initR = initL + initW;
+    const initB = initT + initH;
+
+    if (activeDragMode === 'move') {
+      const newX = Math.max(0.0, Math.min(1.0 - initW, initL + dx));
+      const newY = Math.max(0.0, Math.min(1.0 - initH, initT + dy));
+      maskObj.x = Math.round(newX * 10000) / 10000;
+      maskObj.y = Math.round(newY * 10000) / 10000;
+    } else {
+      let newL = initL;
+      let newT = initT;
+      let newR = initR;
+      let newB = initB;
+
+      if (['w', 'nw', 'sw'].includes(activeDragMode)) {
+        newL = Math.max(0.0, Math.min(initR - 0.05, initL + dx));
+      }
+      if (['e', 'ne', 'se'].includes(activeDragMode)) {
+        newR = Math.max(initL + 0.05, Math.min(1.0, initR + dx));
+      }
+      if (['n', 'nw', 'ne'].includes(activeDragMode)) {
+        newT = Math.max(0.0, Math.min(initB - 0.04, initT + dy));
+      }
+      if (['s', 'sw', 'se'].includes(activeDragMode)) {
+        newB = Math.max(initT + 0.04, Math.min(1.0, initB + dy));
+      }
+
+      maskObj.x = Math.round(newL * 10000) / 10000;
+      maskObj.y = Math.round(newT * 10000) / 10000;
+      maskObj.width = Math.round(Math.max(0.05, newR - newL) * 10000) / 10000;
+      maskObj.height = Math.round(Math.max(0.04, newB - newT) * 10000) / 10000;
+    }
+  }
+
+  renderCanvasOverlays();
+}
+
+function onPointerUpCanvas(e) {
+  if (activeDragMode) {
+    activeDragMode = null;
+    activeDragTargetId = null;
+    window.removeEventListener('pointermove', onPointerMoveCanvas);
+    window.removeEventListener('pointerup', onPointerUpCanvas);
+    window.removeEventListener('pointercancel', onPointerUpCanvas);
   }
 }
 
-function updateSubtitleVisibilityAndPreview() {
+function addNewMaskRegion() {
+  const maskCount = maskRegions.length + 1;
+  const newMask = {
+    id: `mask_${Date.now()}`,
+    x: 0.10,
+    y: Math.max(0.10, Math.min(0.75, 0.70 - (maskCount - 1) * 0.12)),
+    width: 0.80,
+    height: 0.14,
+    type: 'blur', // 'blur' | 'solid'
+    blur_strength: 15,
+    color: '#000000',
+    opacity: 0.85,
+    enabled: true,
+    locked: false,
+  };
+  maskRegions.push(newMask);
+  selectedObjectId = newMask.id;
+  renderMaskRegionsList();
+  renderCanvasOverlays();
+  showToast(`Đã thêm Vùng che #${maskCount}`);
+}
+
+function removeMaskRegion(maskId) {
+  maskRegions = maskRegions.filter((m) => m.id !== maskId);
+  if (selectedObjectId === maskId) {
+    selectedObjectId = 'subtitle';
+  }
+  renderMaskRegionsList();
+  renderCanvasOverlays();
+  showToast('Đã xóa vùng che.');
+}
+
+function toggleMaskVisibility(maskId) {
+  const m = maskRegions.find((item) => item.id === maskId);
+  if (m) {
+    m.enabled = !m.enabled;
+    renderMaskRegionsList();
+    renderCanvasOverlays();
+  }
+}
+
+function toggleMaskLock(maskId) {
+  const m = maskRegions.find((item) => item.id === maskId);
+  if (m) {
+    m.locked = !m.locked;
+    renderMaskRegionsList();
+    renderCanvasOverlays();
+  }
+}
+
+function hexToRgba(hex, alpha = 1.0) {
+  let c = (hex || '#000000').replace('#', '');
+  if (c.length === 3) c = c.split('').map((x) => x + x).join('');
+  const num = parseInt(c, 16) || 0;
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function renderMaskRegionsList() {
+  if (!maskRegionsList) return;
+  const placeholder = document.getElementById('emptyMasksPlaceholder');
+
+  if (maskRegions.length === 0) {
+    maskRegionsList.innerHTML = `
+      <div id="emptyMasksPlaceholder" style="font-size: 0.72rem; color: var(--text-dim); text-align: center; padding: 0.6rem; border: 1px dashed var(--border-subtle); border-radius: var(--radius-sm);">
+        Chưa có vùng che nào. Bấm "+ Thêm vùng che" để tạo.
+      </div>
+    `;
+    return;
+  }
+
+  maskRegionsList.innerHTML = maskRegions
+    .map((m, idx) => {
+      const isActive = selectedObjectId === m.id;
+      const activeClass = isActive ? 'is-active' : '';
+      const isSolid = m.type === 'solid';
+
+      return `
+        <div class="mask-item-card ${activeClass}" data-mask-id="${m.id}">
+          <div class="mask-item-header">
+            <div class="mask-item-title">
+              <span>${isSolid ? '⬛' : '🌫️'}</span>
+              <span>Vùng che #${idx + 1}</span>
+              ${m.locked ? '<span style="font-size:0.65rem; color:#f59e0b;">🔒</span>' : ''}
+              ${!m.enabled ? '<span style="font-size:0.65rem; color:var(--text-dim);">(Ẩn)</span>' : ''}
+            </div>
+            <div class="mask-item-actions">
+              <button type="button" class="btn-mask-icon ${m.enabled ? 'active' : ''}" data-action="toggle-vis" title="${m.enabled ? 'Ẩn vùng che' : 'Hiện vùng che'}">
+                ${m.enabled ? '👁' : '🚫'}
+              </button>
+              <button type="button" class="btn-mask-icon ${m.locked ? 'active' : ''}" data-action="toggle-lock" title="${m.locked ? 'Mở khóa' : 'Khóa vị trí'}">
+                ${m.locked ? '🔒' : '🔓'}
+              </button>
+              <button type="button" class="btn-mask-icon danger" data-action="delete" title="Xóa vùng che">
+                🗑
+              </button>
+            </div>
+          </div>
+
+          <!-- Type selection -->
+          <div style="display: flex; gap: 0.35rem; align-items: center; margin-top: 0.15rem;">
+            <select class="form-select mask-type-select" style="font-size: 0.70rem; padding: 0.2rem 0.4rem; flex: 1;">
+              <option value="blur" ${m.type === 'blur' ? 'selected' : ''}>🌫️ Làm mờ (Blur)</option>
+              <option value="solid" ${m.type === 'solid' ? 'selected' : ''}>⬛ Màu phủ (Solid)</option>
+            </select>
+          </div>
+
+          <!-- Type specific controls -->
+          ${
+            isSolid
+              ? `
+            <div style="display: grid; grid-template-columns: auto 1fr; gap: 0.4rem; align-items: center; margin-top: 0.2rem;">
+              <input type="color" class="color-input mask-color-input" value="${m.color || '#000000'}" style="width: 24px; height: 24px;">
+              <div style="display: flex; flex-direction: column; gap: 0.1rem;">
+                <div style="display: flex; justify-content: space-between; font-size: 0.65rem; color: var(--text-muted);">
+                  <span>Độ phủ</span>
+                  <span class="mask-opacity-label">${Math.round((m.opacity || 0.85) * 100)}%</span>
+                </div>
+                <input type="range" class="range-input mask-opacity-input" min="0" max="1" step="0.05" value="${m.opacity !== undefined ? m.opacity : 0.85}">
+              </div>
+            </div>
+          `
+              : `
+            <div style="display: flex; flex-direction: column; gap: 0.1rem; margin-top: 0.2rem;">
+              <div style="display: flex; justify-content: space-between; font-size: 0.65rem; color: var(--text-muted);">
+                <span>Độ mờ (Blur)</span>
+                <span class="mask-blur-label">${m.blur_strength || 15}px</span>
+              </div>
+              <input type="range" class="range-input mask-blur-input" min="2" max="30" step="1" value="${m.blur_strength || 15}">
+            </div>
+          `
+          }
+        </div>
+      `;
+    })
+    .join('');
+
+  // Attach card event listeners
+  maskRegionsList.querySelectorAll('.mask-item-card').forEach((card) => {
+    const maskId = card.dataset.maskId;
+    const maskObj = maskRegions.find((m) => m.id === maskId);
+    if (!maskObj) return;
+
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('button') || e.target.closest('input') || e.target.closest('select')) return;
+      selectedObjectId = maskId;
+      renderMaskRegionsList();
+      renderCanvasOverlays();
+    });
+
+    const btnVis = card.querySelector('[data-action="toggle-vis"]');
+    if (btnVis) btnVis.addEventListener('click', () => toggleMaskVisibility(maskId));
+
+    const btnLock = card.querySelector('[data-action="toggle-lock"]');
+    if (btnLock) btnLock.addEventListener('click', () => toggleMaskLock(maskId));
+
+    const btnDel = card.querySelector('[data-action="delete"]');
+    if (btnDel) btnDel.addEventListener('click', () => removeMaskRegion(maskId));
+
+    const typeSelect = card.querySelector('.mask-type-select');
+    if (typeSelect) {
+      typeSelect.addEventListener('change', (e) => {
+        maskObj.type = e.target.value;
+        renderMaskRegionsList();
+        renderCanvasOverlays();
+      });
+    }
+
+    const blurInput = card.querySelector('.mask-blur-input');
+    if (blurInput) {
+      blurInput.addEventListener('input', (e) => {
+        maskObj.blur_strength = parseInt(e.target.value) || 15;
+        const label = card.querySelector('.mask-blur-label');
+        if (label) label.textContent = `${maskObj.blur_strength}px`;
+        renderCanvasOverlays();
+      });
+    }
+
+    const colorInput = card.querySelector('.mask-color-input');
+    if (colorInput) {
+      colorInput.addEventListener('input', (e) => {
+        maskObj.color = e.target.value;
+        renderCanvasOverlays();
+      });
+    }
+
+    const opacityInput = card.querySelector('.mask-opacity-input');
+    if (opacityInput) {
+      opacityInput.addEventListener('input', (e) => {
+        maskObj.opacity = parseFloat(e.target.value) || 0.85;
+        const label = card.querySelector('.mask-opacity-label');
+        if (label) label.textContent = `${Math.round(maskObj.opacity * 100)}%`;
+        renderCanvasOverlays();
+      });
+    }
+  });
+}
+
+function renderCanvasOverlays() {
   const isEnabled = optSubtitle ? optSubtitle.checked : true;
   const hasVideoLoaded = Boolean(
     videoPreview &&
@@ -719,48 +1121,155 @@ function updateSubtitleVisibilityAndPreview() {
     (videoPreview.src || (currentJobId && dropzone && dropzone.style.display === 'none'))
   );
 
-  if (isEnabled) {
-    if (subtitleStyleCard) {
-      subtitleStyleCard.style.opacity = '1';
-      subtitleStyleCard.style.pointerEvents = 'auto';
+  // 1. LAYER 1 (z=10): MASK CANVAS OVERLAY
+  if (maskCanvasLayer) {
+    if (!hasVideoLoaded) {
+      maskCanvasLayer.innerHTML = '';
+      maskCanvasLayer.style.display = 'none';
+    } else {
+      maskCanvasLayer.style.display = 'block';
+      maskCanvasLayer.innerHTML = maskRegions
+        .filter((m) => m.enabled)
+        .map((m) => {
+          const isSolid = m.type === 'solid';
+          const bgStyle = isSolid ? hexToRgba(m.color, m.opacity) : 'rgba(0,0,0,0.18)';
+          const blurVal = `${m.blur_strength || 15}px`;
+
+          return `
+            <div class="mask-region-box type-${m.type}" style="
+              left: ${(m.x * 100).toFixed(2)}%;
+              top: ${(m.y * 100).toFixed(2)}%;
+              width: ${(m.width * 100).toFixed(2)}%;
+              height: ${(m.height * 100).toFixed(2)}%;
+              --blur-px: ${blurVal};
+              --mask-solid-bg: ${bgStyle};
+            "></div>
+          `;
+        })
+        .join('');
     }
-    if (subModeSubOption) {
-      subModeSubOption.style.opacity = '1';
-      subModeSubOption.style.pointerEvents = 'auto';
-    }
-    if (subtitleLiveOverlay) {
-      ensureSubtitleOverlayElements();
-      if (hasVideoLoaded) {
-        subtitleLiveOverlay.style.display = 'block';
-        updateSubtitleOverlayStyles();
-        updateSubtitleOverlayText();
-      } else {
-        subtitleLiveOverlay.style.display = 'none';
-      }
-    }
-  } else {
-    if (subtitleStyleCard) {
-      subtitleStyleCard.style.opacity = '0.4';
-      subtitleStyleCard.style.pointerEvents = 'none';
-    }
-    if (subModeSubOption) {
-      subModeSubOption.style.opacity = '0.4';
-      subModeSubOption.style.pointerEvents = 'none';
-    }
-    if (subtitleLiveOverlay) {
+  }
+
+  // 2. LAYER 2 (z=20): SUBTITLE LIVE OVERLAY
+  if (subtitleLiveOverlay) {
+    if (!hasVideoLoaded || !isEnabled) {
       subtitleLiveOverlay.style.display = 'none';
+      subtitleLiveOverlay.innerHTML = '';
+    } else {
+      subtitleLiveOverlay.style.display = 'block';
+      const leftPct = ((subtitleLayout.x - subtitleLayout.width / 2) * 100).toFixed(2);
+      const topPct = ((subtitleLayout.y - subtitleLayout.height / 2) * 100).toFixed(2);
+      const wPct = (subtitleLayout.width * 100).toFixed(2);
+      const hPct = (subtitleLayout.height * 100).toFixed(2);
+
+      let curText = 'Đây là phụ đề';
+      if (currentSegments && currentSegments.length > 0 && videoPreview && videoPreview.currentTime > 0) {
+        const curTime = videoPreview.currentTime;
+        const activeSeg = currentSegments.find((s) => curTime >= s.start && curTime <= s.end);
+        if (activeSeg) {
+          curText = activeSeg.translated_text || activeSeg.text || activeSeg.original_text || '';
+        } else {
+          curText = '';
+        }
+      }
+
+      subtitleLiveOverlay.innerHTML = `
+        <div class="subtitle-draggable-box" id="subtitleDraggableBox" style="
+          left: ${leftPct}%;
+          top: ${topPct}%;
+          width: ${wPct}%;
+          height: ${hPct}%;
+        ">
+          <span class="subtitle-text-content" id="subtitleTextContent" style="${curText ? '' : 'display:none;'}">${escapeHtml(curText)}</span>
+        </div>
+      `;
+
+      updateSubtitleOverlayStyles();
+    }
+  }
+
+  // 3. LAYER 3 (z=30): EDITOR INTERACTION & 8-POINT HANDLES LAYER
+  if (editorInteractionLayer) {
+    if (!hasVideoLoaded) {
+      editorInteractionLayer.innerHTML = '';
+      editorInteractionLayer.style.display = 'none';
+    } else {
+      editorInteractionLayer.style.display = 'block';
+      const handlesHtml = `
+        <div class="resize-handle handle-nw" data-handle="nw"></div>
+        <div class="resize-handle handle-n" data-handle="n"></div>
+        <div class="resize-handle handle-ne" data-handle="ne"></div>
+        <div class="resize-handle handle-e" data-handle="e"></div>
+        <div class="resize-handle handle-se" data-handle="se"></div>
+        <div class="resize-handle handle-s" data-handle="s"></div>
+        <div class="resize-handle handle-sw" data-handle="sw"></div>
+        <div class="resize-handle handle-w" data-handle="w"></div>
+      `;
+
+      let boxesHtml = '';
+
+      // Mask Bounding Boxes
+      maskRegions.forEach((m) => {
+        if (!m.enabled) return;
+        const isSel = selectedObjectId === m.id;
+        const leftPct = (m.x * 100).toFixed(2);
+        const topPct = (m.y * 100).toFixed(2);
+        const wPct = (m.width * 100).toFixed(2);
+        const hPct = (m.height * 100).toFixed(2);
+
+        boxesHtml += `
+          <div class="editor-bounding-box mask-box ${isSel ? 'is-selected' : ''} ${m.locked ? 'is-locked' : ''}" data-object-id="${m.id}" style="
+            left: ${leftPct}%;
+            top: ${topPct}%;
+            width: ${wPct}%;
+            height: ${hPct}%;
+          ">
+            ${isSel && !m.locked ? handlesHtml : ''}
+          </div>
+        `;
+      });
+
+      // Subtitle Bounding Box
+      if (isEnabled) {
+        const isSel = selectedObjectId === 'subtitle';
+        const leftPct = ((subtitleLayout.x - subtitleLayout.width / 2) * 100).toFixed(2);
+        const topPct = ((subtitleLayout.y - subtitleLayout.height / 2) * 100).toFixed(2);
+        const wPct = (subtitleLayout.width * 100).toFixed(2);
+        const hPct = (subtitleLayout.height * 100).toFixed(2);
+
+        boxesHtml += `
+          <div class="editor-bounding-box ${isSel ? 'is-selected' : ''}" data-object-id="subtitle" style="
+            left: ${leftPct}%;
+            top: ${topPct}%;
+            width: ${wPct}%;
+            height: ${hPct}%;
+          ">
+            ${isSel ? handlesHtml : ''}
+          </div>
+        `;
+      }
+
+      editorInteractionLayer.innerHTML = boxesHtml;
     }
   }
 }
 
+function updateSubtitleVisibilityAndPreview() {
+  const isEnabled = optSubtitle ? optSubtitle.checked : true;
+  if (subtitleStyleCard) {
+    subtitleStyleCard.style.opacity = isEnabled ? '1' : '0.4';
+    subtitleStyleCard.style.pointerEvents = isEnabled ? 'auto' : 'none';
+  }
+  if (subModeSubOption) {
+    subModeSubOption.style.opacity = isEnabled ? '1' : '0.4';
+    subModeSubOption.style.pointerEvents = isEnabled ? 'auto' : 'none';
+  }
+  renderCanvasOverlays();
+}
+
 function updateSubtitleOverlayStyles() {
-  if (!subtitleLiveOverlay || (optSubtitle && !optSubtitle.checked)) return;
-
-  ensureSubtitleOverlayElements();
-
-  const box = document.getElementById('subtitleDraggableBox');
   const textContent = document.getElementById('subtitleTextContent');
-  if (!box || !textContent) return;
+  if (!textContent) return;
 
   const font = subFontFamily ? subFontFamily.value || 'Arial' : 'Arial';
   const size = subFontSize ? parseInt(subFontSize.value) || 36 : 36;
@@ -775,18 +1284,11 @@ function updateSubtitleOverlayStyles() {
   const scale = Math.max(0.4, Math.min(1.0, frameW / 1000));
   const effectiveSize = Math.round(size * scale);
 
-  // Áp dụng vị trí tương đối trực tiếp (0.0 đến 1.0)
-  box.style.left = `${(subtitlePosition.x * 100).toFixed(2)}%`;
-  box.style.top = `${(subtitlePosition.y * 100).toFixed(2)}%`;
-  box.style.transform = 'translate(-50%, -50%)';
-
-  // Typography & Styling
   textContent.style.fontFamily = `"${font}", sans-serif`;
   textContent.style.fontSize = `${effectiveSize}px`;
   textContent.style.fontWeight = bold ? '700' : '400';
   textContent.style.color = color;
 
-  // Outline & Drop shadow
   if (strokeW > 0) {
     const scaledStroke = Math.max(1, (strokeW * scale).toFixed(1));
     textContent.style.webkitTextStroke = `${scaledStroke}px ${outlineColor}`;
@@ -803,32 +1305,7 @@ function updateSubtitleOverlayStyles() {
 }
 
 function updateSubtitleOverlayText() {
-  if (!subtitleLiveOverlay || (optSubtitle && !optSubtitle.checked)) return;
-
-  ensureSubtitleOverlayElements();
-  const textContent = document.getElementById('subtitleTextContent');
-  if (!textContent) return;
-
-  // Nếu đã có phụ đề thật và video đang phát: Đồng bộ theo video.currentTime
-  if (currentSegments && currentSegments.length > 0 && videoPreview && videoPreview.currentTime > 0) {
-    const curTime = videoPreview.currentTime;
-    const activeSeg = currentSegments.find((s) => curTime >= s.start && curTime <= s.end);
-
-    if (activeSeg) {
-      const txt = activeSeg.translated_text || activeSeg.text || activeSeg.original_text || '';
-      textContent.textContent = txt;
-      textContent.style.display = 'inline-block';
-      return;
-    } else {
-      textContent.textContent = '';
-      textContent.style.display = 'none';
-      return;
-    }
-  }
-
-  // Khi chưa phát hoặc chưa có transcript dịch: Hiển thị câu mẫu để người dùng kéo thả & căn chỉnh
-  textContent.textContent = 'Đây là phụ đề';
-  textContent.style.display = 'inline-block';
+  renderCanvasOverlays();
 }
 
 function getSubtitleStyleConfig() {
@@ -838,28 +1315,50 @@ function getSubtitleStyleConfig() {
     primary_color: subTextColor ? subTextColor.value || '#FFFFFF' : '#FFFFFF',
     outline_color: subOutlineColor ? subOutlineColor.value || '#000000' : '#000000',
     outline_width: subOutlineWidth ? parseFloat(subOutlineWidth.value) || 2.5 : 2.5,
-    position_x: subtitlePosition.x,
-    position_y: subtitlePosition.y,
+    position_x: subtitleLayout.x,
+    position_y: subtitleLayout.y,
+    width: subtitleLayout.width,
+    height: subtitleLayout.height,
     bold: subBoldCheckbox ? subBoldCheckbox.checked : true,
     shadow: subShadowCheckbox ? (subShadowCheckbox.checked ? 1.0 : 0.0) : 1.0,
   };
 }
 
+function getMaskRegionsConfig() {
+  return maskRegions.map((m) => ({
+    id: m.id,
+    x: m.x,
+    y: m.y,
+    width: m.width,
+    height: m.height,
+    type: m.type || 'blur',
+    blur_strength: m.blur_strength || 15,
+    color: m.color || '#000000',
+    opacity: m.opacity !== undefined ? m.opacity : 0.85,
+    enabled: m.enabled !== false,
+    locked: Boolean(m.locked),
+  }));
+}
+
 // ================= FILE UPLOAD & BATCH MANAGEMENT (NO AUTO-RUN) =================
 async function handleFilesSelected(files) {
   if (!files || files.length === 0) return;
+  const selectedFiles = Array.from(files);
+
+  console.log('[UPLOAD] Bắt đầu tải lên:', selectedFiles.length, 'file');
 
   // 1. Luôn Reset sạch workspace trước khi thực hiện upload file mới (Unified cleanup)
   resetWorkspaceToNoJob();
+  const uploadGen = ++workspaceGeneration;
 
   // Validate số lượng file (1 đến 5 video)
-  if (files.length > 5) {
+  if (selectedFiles.length > 5) {
     showToast('Tối đa 5 video cho mỗi lượt xử lý (TEST 5)', 'error');
     return;
   }
 
   // Validate định dạng
-  for (const f of files) {
+  for (const f of selectedFiles) {
     const ext = '.' + f.name.split('.').pop().toLowerCase();
     if (!ALLOWED_EXTENSIONS.includes(ext)) {
       showToast(`File "${f.name}" không hợp lệ. Chỉ chấp nhận MP4, MOV, MKV, WEBM.`, 'error');
@@ -869,18 +1368,24 @@ async function handleFilesSelected(files) {
 
   // Hiển thị upload progress
   progressBox.style.display = 'block';
-  progressStatus.textContent = files.length > 1 ? `Đang tải lên ${files.length} video...` : 'Đang tải video lên máy chủ...';
+  progressStatus.textContent = selectedFiles.length > 1 ? `Đang tải lên ${selectedFiles.length} video...` : 'Đang tải video lên máy chủ...';
   progressBarFill.style.width = '10%';
   progressPercent.textContent = '10%';
   dropzone.style.display = 'none';
 
   try {
-    if (files.length === 1) {
+    if (selectedFiles.length === 1) {
       // 1 Video Upload (100% Tương thích ngược)
-      const res = await apiClient.uploadVideo(files[0], (pct) => {
+      const res = await apiClient.uploadVideo(selectedFiles[0], (pct) => {
+        if (workspaceGeneration !== uploadGen) return;
         progressBarFill.style.width = `${pct}%`;
         progressPercent.textContent = `${pct}%`;
       });
+
+      if (workspaceGeneration !== uploadGen) {
+        console.warn('[UPLOAD] Bỏ qua kết quả upload do workspace đã đổi');
+        return;
+      }
 
       workspaceMode = 'job';
       currentJob = res;
@@ -898,17 +1403,23 @@ async function handleFilesSelected(files) {
       localStorage.removeItem('last_batch_id');
 
       batchQueueBar.style.display = 'none';
-      bindVideoToPreview(files[0], res.video);
+      bindVideoToPreview(selectedFiles[0], res.video);
 
       // Đưa giao diện về trạng thái UPLOADED / READY (TUYỆT ĐỐI KHÔNG TỰ CHẠY PIPELINE)
       renderUploadedReadyState(res);
       showToast('Tải lên video thành công. Hãy chọn cấu hình và nhấn BẮT ĐẦU XỬ LÝ.');
     } else {
       // Batch Upload 2-5 Videos (Phase 3)
-      const res = await apiClient.uploadBatchVideos(files, (pct) => {
+      const res = await apiClient.uploadBatchVideos(selectedFiles, (pct) => {
+        if (workspaceGeneration !== uploadGen) return;
         progressBarFill.style.width = `${pct}%`;
         progressPercent.textContent = `${pct}%`;
       });
+
+      if (workspaceGeneration !== uploadGen) {
+        console.warn('[UPLOAD] Bỏ qua kết quả upload do workspace đã đổi');
+        return;
+      }
 
       workspaceMode = 'batch';
       currentBatchId = res.batch_id;
@@ -926,13 +1437,14 @@ async function handleFilesSelected(files) {
       localStorage.setItem('last_job_id', currentJobId);
 
       renderBatchQueueBar();
-      bindVideoToPreview(files[0], batchJobs[0].video);
+      bindVideoToPreview(selectedFiles[0], batchJobs[0].video);
 
       // Đưa giao diện về trạng thái UPLOADED / READY
       renderUploadedReadyState(batchJobs[0]);
       showToast(`Đã tải lên ${batchJobs.length} video vào hàng đợi. Sẵn sàng xử lý.`);
     }
   } catch (err) {
+    console.error('[UPLOAD_FATAL]', err);
     showToast(err.message || 'Lỗi khi tải lên file', 'error');
     resetWorkspaceToNoJob();
   }
@@ -980,15 +1492,26 @@ function renderUploadedReadyState(job) {
   // 7. Final Video: Chờ xử lý
   renderFinalVideoOutput(job);
 
-  // 8. Cập nhật Live Overlay
+  // 8. Cập nhật Live Overlay & Masks
+  renderMaskRegionsList();
   updateSubtitleVisibilityAndPreview();
 }
 
+let currentPreviewObjectUrl = null;
+
 function bindVideoToPreview(fileOrUrl, videoMeta) {
+  if (currentPreviewObjectUrl) {
+    try {
+      URL.revokeObjectURL(currentPreviewObjectUrl);
+    } catch (e) {}
+    currentPreviewObjectUrl = null;
+  }
+
   if (typeof fileOrUrl === 'string') {
     videoPreview.src = fileOrUrl;
   } else if (fileOrUrl instanceof File) {
-    videoPreview.src = URL.createObjectURL(fileOrUrl);
+    currentPreviewObjectUrl = URL.createObjectURL(fileOrUrl);
+    videoPreview.src = currentPreviewObjectUrl;
   } else if (videoMeta && videoMeta.preview_url) {
     videoPreview.src = videoMeta.preview_url;
   }
@@ -1083,6 +1606,11 @@ async function handleRunPipeline() {
     return;
   }
 
+  // Nếu job hiện tại đang ở trạng thái failed, chuyển hướng sang handleRetry(true) để áp dụng RetryPlan
+  if (currentJob && currentJob.status === 'failed') {
+    return handleRetry(true);
+  }
+
   isProcessing = true;
   runPipelineBtn.disabled = true;
   runPipelineBtn.classList.add('btn-disabled');
@@ -1115,17 +1643,27 @@ async function handleRunPipeline() {
     output_format: formatSelect.value,
     api_key: geminiApiKeyInput.value.trim() || null,
     subtitle_style: getSubtitleStyleConfig(),
+    mask_regions: getMaskRegionsConfig(),
   };
 
   try {
     if (currentBatchId && batchJobs.length > 1) {
       // Chạy Batch tuần tự (concurrency = 1)
-      await apiClient.processBatch(currentBatchId, config);
+      const res = await apiClient.processBatch(currentBatchId, config);
       showToast(`Đã bắt đầu xử lý tuần tự ${batchJobs.length} video.`);
       startBatchPolling(currentBatchId);
     } else {
       // Chạy 1 Job đơn lẻ
-      await apiClient.processPipeline(currentJobId, config);
+      const res = await apiClient.processPipeline(currentJobId, config);
+      if (currentJob) {
+        currentJob.status = 'processing';
+        if (res.stages) currentJob.stages = res.stages;
+        if (currentJob.artifacts && currentJob.artifacts.final_video) {
+          currentJob.artifacts.final_video.current = false;
+          currentJob.artifacts.final_video.reprocessing = true;
+        }
+        renderJobState(currentJob);
+      }
       showToast('Đã bắt đầu tiến trình xử lý video.');
       startJobPolling(currentJobId);
     }
@@ -1178,6 +1716,7 @@ async function handleRetry(resumeFromFailed = true) {
     output_format: formatSelect.value,
     api_key: geminiApiKeyInput.value.trim() || null,
     subtitle_style: getSubtitleStyleConfig(),
+    mask_regions: getMaskRegionsConfig(),
   };
 
   try {
@@ -1186,6 +1725,17 @@ async function handleRetry(resumeFromFailed = true) {
       pipeline_config: config,
     });
     retryActionBox.style.display = 'none';
+    if (res.stages) {
+      if (currentJob) {
+        currentJob.stages = res.stages;
+        currentJob.status = res.status || 'processing';
+        currentJob.progress = res.progress !== undefined ? res.progress : currentJob.progress;
+      }
+      renderPipelinePills(res.stages);
+      renderStepperItems(res.stages);
+    }
+    progressBox.style.display = 'block';
+    progressStatus.textContent = res.message || 'Đang tiếp tục xử lý...';
     showToast(resumeFromFailed ? 'Đang thử lại từ đoạn bị lỗi...' : 'Đang chạy lại toàn bộ pipeline...');
     startJobPolling(currentJobId);
   } catch (err) {
@@ -1347,14 +1897,31 @@ function renderJobState(job) {
     progressStatus.textContent = `Thất bại: ${job.error || 'Lỗi xử lý'}`;
     progressBarFill.style.background = '#ef4444';
   } else {
-    progressStatus.textContent = 'Đang thực thi pipeline...';
+    const activeStageKey = Object.keys(stages).find((k) => stages[k] && stages[k].status === 'running');
+    const activeStage = activeStageKey ? stages[activeStageKey] : null;
+    const stageMsg = activeStage && activeStage.message ? activeStage.message : 'Đang thực thi pipeline...';
+    progressStatus.textContent = stageMsg;
     progressBarFill.style.background = 'linear-gradient(90deg, #10b981 0%, #06b6d4 100%)';
   }
 
   // 2. Retry Box (Phase 1)
   if (isFailed) {
     retryActionBox.style.display = 'block';
-    retryErrorMessage.textContent = `Tác vụ bị lỗi: ${job.error || 'Chi tiết trong nhật ký'}`;
+    btnRetryFailed.disabled = false;
+    btnRerunAll.disabled = false;
+    btnRetryFailed.innerHTML = '<span>🔄</span> Thử lại từ đoạn lỗi';
+    btnRerunAll.innerHTML = '<span>⏮</span> Chạy lại từ đầu';
+
+    const errText = job.error || '';
+    if (errText.includes('API_KEY_INVALID') || errText.includes('Khóa Gemini API')) {
+      retryErrorMessage.innerHTML = `🔑 <strong>Gemini API Key không hợp lệ:</strong> Vui lòng bấm "Thay đổi" tại mục Cấu hình dịch thuật để nhập API Key mới, sau đó bấm <strong>Thử lại từ đoạn lỗi</strong>.`;
+    } else if (errText.includes('TASK_INTERRUPTED_SERVER_RESTART') || errText.includes('máy chủ khởi động lại')) {
+      retryErrorMessage.innerHTML = `🔄 <strong>Máy chủ đã khởi động lại:</strong> Toàn bộ đoạn audio đã tổng hợp được bảo toàn 100%. Bấm <strong>Thử lại từ đoạn lỗi</strong> để tiếp tục ngay.`;
+    } else if (errText.includes('AUDIO_SYNC_MISSING_TTS_ARTIFACT') || errText.includes('AUDIO_SYNC_INVALID_SEGMENT_SCHEMA') || errText.includes('AUDIO_SYNC_INVALID_RESULT')) {
+      retryErrorMessage.innerHTML = `⚠️ <strong>Lỗi đồng bộ âm thanh:</strong> ${escapeHtml(errText)}. Bấm <strong>Thử lại từ đoạn lỗi</strong> để tự động tái tạo và đồng bộ lại.`;
+    } else {
+      retryErrorMessage.textContent = `Tác vụ bị lỗi: ${errText || 'Chi tiết trong nhật ký'}`;
+    }
   } else {
     retryActionBox.style.display = 'none';
   }
@@ -1372,10 +1939,58 @@ function renderJobState(job) {
   // 6. Final Video Output Card
   renderFinalVideoOutput(job);
 
-  // 7. Live Subtitle Overlay Preview
+  // 7. Khôi phục subtitle style & mask regions từ config_snapshot nếu có
+  if (job.config_snapshot) {
+    const cfg = job.config_snapshot;
+    if (cfg.subtitle_style) {
+      const s = cfg.subtitle_style;
+      if (s.font_family && subFontFamily) subFontFamily.value = s.font_family;
+      if (s.font_size && subFontSize) subFontSize.value = s.font_size;
+      if (s.primary_color && subTextColor) {
+        subTextColor.value = s.primary_color;
+        if (subTextColorLabel) subTextColorLabel.textContent = s.primary_color.toUpperCase();
+      }
+      if (s.outline_color && subOutlineColor) {
+        subOutlineColor.value = s.outline_color;
+        if (subOutlineColorLabel) subOutlineColorLabel.textContent = s.outline_color.toUpperCase();
+      }
+      if (s.outline_width !== undefined && subOutlineWidth) {
+        subOutlineWidth.value = s.outline_width;
+        if (subOutlineWidthValue) subOutlineWidthValue.textContent = `${s.outline_width}px`;
+      }
+      if (s.bold !== undefined && subBoldCheckbox) subBoldCheckbox.checked = Boolean(s.bold);
+      if (s.shadow !== undefined && subShadowCheckbox) subShadowCheckbox.checked = Boolean(s.shadow);
+      if (s.position_x !== undefined && s.position_y !== undefined) {
+        subtitleLayout.x = parseFloat(s.position_x);
+        subtitleLayout.y = parseFloat(s.position_y);
+        subtitlePosition.x = subtitleLayout.x;
+        subtitlePosition.y = subtitleLayout.y;
+      }
+      if (s.width !== undefined) subtitleLayout.width = parseFloat(s.width);
+      if (s.height !== undefined) subtitleLayout.height = parseFloat(s.height);
+    }
+    if (Array.isArray(cfg.mask_regions)) {
+      maskRegions = cfg.mask_regions.map((m) => ({
+        id: m.id || `mask_${Math.random()}`,
+        x: parseFloat(m.x !== undefined ? m.x : 0.10),
+        y: parseFloat(m.y !== undefined ? m.y : 0.75),
+        width: parseFloat(m.width !== undefined ? m.width : 0.80),
+        height: parseFloat(m.height !== undefined ? m.height : 0.15),
+        type: m.type || 'blur',
+        blur_strength: m.blur_strength || 15,
+        color: m.color || '#000000',
+        opacity: m.opacity !== undefined ? m.opacity : 0.85,
+        enabled: m.enabled !== false,
+        locked: Boolean(m.locked),
+      }));
+    }
+  }
+
+  // 8. Live Subtitle Overlay & Mask Preview
+  renderMaskRegionsList();
   updateSubtitleVisibilityAndPreview();
 
-  // 8. Start Button State
+  // 9. Start Button State
   if (job.status === 'processing') {
     runPipelineBtn.disabled = true;
     runPipelineBtn.classList.add('btn-disabled');
@@ -1476,9 +2091,13 @@ function renderProcessingLogs(stages) {
 
       let statusBadge = `<span class="badge-status-completed">✓ Hoàn tất</span>`;
       if (st.status === 'running') {
-        const hasPct = st.progress !== null && st.progress !== undefined && !isNaN(st.progress);
-        const pct = hasPct ? ` (${Math.round(st.progress)}%)` : '';
-        statusBadge = `<span class="badge-status-running">⏳ Đang xử lý${pct}</span>`;
+        if (st.is_retrying && st.automatic_attempt) {
+          statusBadge = `<span class="badge-status-running" style="color: #fbbf24; border-color: rgba(251, 191, 36, 0.3);">🔄 Tự thử lại (${st.automatic_attempt}/${st.max_automatic_attempts || 3})</span>`;
+        } else {
+          const hasPct = st.progress !== null && st.progress !== undefined && !isNaN(st.progress);
+          const pct = hasPct ? ` (${Math.round(st.progress)}%)` : '';
+          statusBadge = `<span class="badge-status-running">⏳ Đang xử lý${pct}</span>`;
+        }
       } else if (st.status === 'failed') {
         statusBadge = `<span class="badge-status-failed">✕ Thất bại</span>`;
       }
@@ -1540,8 +2159,8 @@ function renderSubtitles() {
   downloadTranslatedSrtBtn.classList.remove('btn-disabled');
 
   if (currentJobId) {
-    downloadOriginalSrtBtn.onclick = () => window.open(`/api/jobs/${currentJobId}/download/subtitle`, '_blank');
-    downloadTranslatedSrtBtn.onclick = () => window.open(`/api/jobs/${currentJobId}/download/subtitle`, '_blank');
+    downloadOriginalSrtBtn.onclick = () => window.open(`/api/jobs/${currentJobId}/download/subtitle?type=original`, '_blank');
+    downloadTranslatedSrtBtn.onclick = () => window.open(`/api/jobs/${currentJobId}/download/subtitle?type=translated`, '_blank');
   }
 
   const query = (subSearchInput.value || '').trim().toLowerCase();
@@ -1604,7 +2223,9 @@ function renderSubtitles() {
 function renderFinalVideoOutput(job) {
   const artifacts = job.artifacts || {};
   const finalMeta = artifacts.final_video || job.video || {};
-  const isRenderCompleted = job.stages && job.stages.render && job.stages.render.status === 'completed' && finalMeta.available;
+  const renderStage = job.stages && job.stages.render ? job.stages.render : {};
+  const isRenderCompleted = renderStage.status === 'completed' && Boolean(finalMeta.available) && finalMeta.current !== false;
+  const isReprocessing = Boolean(finalMeta.reprocessing) || ((job.status === 'processing' || renderStage.status === 'running' || renderStage.status === 'pending') && Boolean(finalMeta.available || finalMeta.revision));
 
   if (isRenderCompleted) {
     finalVideoEmpty.style.display = 'none';
@@ -1612,7 +2233,17 @@ function renderFinalVideoOutput(job) {
     finalVideoStatusBadge.textContent = '🟢 Sẵn sàng tải về';
     finalVideoStatusBadge.style.color = 'var(--emerald-400)';
 
-    finalVideoPlayer.src = finalMeta.video_url || `/api/jobs/${job.job_id}/result/video`;
+    const targetUrl = finalMeta.video_url || `/api/jobs/${job.job_id}/result/video?v=${finalMeta.revision || 1}`;
+    if (finalVideoPlayer.dataset.loadedUrl !== targetUrl) {
+      finalVideoPlayer.pause();
+      finalVideoPlayer.removeAttribute('src');
+      finalVideoPlayer.load();
+      finalVideoPlayer.src = targetUrl;
+      finalVideoPlayer.load();
+      finalVideoPlayer.dataset.loadedUrl = targetUrl;
+      finalVideoPlayer.dataset.revision = String(finalMeta.revision || 1);
+    }
+
     finalThumbDuration.textContent = finalMeta.duration_formatted || '00:00';
     finalVideoName.textContent = finalMeta.filename || 'final_dubbed.mp4';
     finalVideoRes.textContent = finalMeta.resolution || '1080p';
@@ -1621,7 +2252,8 @@ function renderFinalVideoOutput(job) {
     finalVideoDuration.textContent = finalMeta.duration_formatted || '—';
     finalVideoDate.textContent = new Date().toLocaleDateString('vi-VN');
 
-    downloadVideoBtn.href = finalMeta.download_video_url || `/api/jobs/${job.job_id}/download/video`;
+    downloadVideoBtn.href = finalMeta.download_video_url || `/api/jobs/${job.job_id}/download/video?v=${finalMeta.revision || 1}`;
+    downloadVideoBtn.setAttribute('download', finalMeta.filename || 'final_dubbed.mp4');
     downloadVideoBtn.disabled = false;
     downloadVideoBtn.classList.remove('btn-disabled');
 
@@ -1630,13 +2262,32 @@ function renderFinalVideoOutput(job) {
       downloadSrtBtn.disabled = false;
       downloadSrtBtn.classList.remove('btn-disabled');
     }
+  } else if (isReprocessing) {
+    finalVideoEmpty.style.display = 'none';
+    finalVideoContent.style.display = 'grid';
+    finalVideoStatusBadge.textContent = '🟡 Đang tạo lại...';
+    finalVideoStatusBadge.style.color = '#fbbf24';
+
+    finalVideoPlayer.pause();
+    downloadVideoBtn.disabled = true;
+    downloadVideoBtn.classList.add('btn-disabled');
+    downloadVideoBtn.removeAttribute('href');
+    if (downloadSrtBtn) {
+      downloadSrtBtn.disabled = true;
+      downloadSrtBtn.classList.add('btn-disabled');
+    }
   } else {
     finalVideoEmpty.style.display = 'flex';
     finalVideoContent.style.display = 'none';
     finalVideoStatusBadge.textContent = '⚪ Chờ xử lý';
     finalVideoStatusBadge.style.color = 'var(--text-dim)';
+    finalVideoPlayer.pause();
+    finalVideoPlayer.removeAttribute('src');
+    finalVideoPlayer.dataset.loadedUrl = '';
+    finalVideoPlayer.dataset.revision = '';
     downloadVideoBtn.disabled = true;
     downloadVideoBtn.classList.add('btn-disabled');
+    downloadVideoBtn.removeAttribute('href');
   }
 }
 

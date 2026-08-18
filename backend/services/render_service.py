@@ -69,6 +69,84 @@ async def validate_final_render(
     return validation_summary
 
 
+def build_video_filter_graph(
+    mask_regions: Optional[List[Dict[str, Any]]],
+    burn_subtitles: bool,
+    ass_subtitle_path: Optional[Path],
+    srt_subtitle_path: Optional[Path],
+    subtitle_style: Optional[Dict[str, Any]],
+    video_width: int = 1920,
+    video_height: int = 1080,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Xây dựng chuỗi Video Filter graph đa tầng:
+    Input [0:v] -> Vùng che / Blur (Mask Layer, z=10) -> Subtitle Burn (Subtitle Layer, z=20) -> [vout]
+    Bảo đảm bất biến: Subtitle luôn nằm trên Mask và không bao giờ bị blur.
+    """
+    active_masks = [m for m in (mask_regions or []) if m.get("enabled", True)]
+    has_sub = burn_subtitles and ((ass_subtitle_path and ass_subtitle_path.exists()) or (srt_subtitle_path and srt_subtitle_path.exists()))
+
+    if not active_masks and not has_sub:
+        return None, None
+
+    v_filters = []
+    cur_label = "0:v"
+
+    # 1. Áp dụng từng Mask / Blur region (Mask Layer)
+    for i, m in enumerate(active_masks):
+        raw_x = max(0.0, min(1.0, float(m.get("x", 0.10))))
+        raw_y = max(0.0, min(1.0, float(m.get("y", 0.75))))
+        raw_w = max(0.02, min(1.0 - raw_x, float(m.get("width", 0.80))))
+        raw_h = max(0.02, min(1.0 - raw_y, float(m.get("height", 0.15))))
+
+        w_box = max(2, int(round(raw_w * video_width)))
+        h_box = max(2, int(round(raw_h * video_height)))
+        # Đảm bảo kích thước chẵn cho bộ mã hóa YUV420p
+        w_box = w_box - (w_box % 2)
+        h_box = h_box - (h_box % 2)
+
+        x_px = min(int(round(raw_x * video_width)), max(0, video_width - w_box))
+        y_px = min(int(round(raw_y * video_height)), max(0, video_height - h_box))
+
+        mask_type = m.get("type", "blur")
+        if mask_type == "solid":
+            color_hex = str(m.get("color", "#000000")).replace("#", "0x")
+            opacity = max(0.0, min(1.0, float(m.get("opacity", 0.85))))
+            next_label = f"v_mask_{i}"
+            v_filters.append(f"[{cur_label}]drawbox=x={x_px}:y={y_px}:w={w_box}:h={h_box}:color={color_hex}@{opacity:.2f}:t=fill[{next_label}]")
+            cur_label = next_label
+        else:
+            # Blur region
+            strength = max(1, min(30, int(m.get("blur_strength", 15))))
+            luma_rad = max(2, min(40, strength * 2))
+            split_base = f"v_base_{i}"
+            split_crop = f"v_crop_{i}"
+            v_blur = f"v_blur_{i}"
+            next_label = f"v_mask_{i}"
+
+            v_filters.append(f"[{cur_label}]split=2[{split_base}][{split_crop}]")
+            v_filters.append(f"[{split_crop}]crop={w_box}:{h_box}:{x_px}:{y_px},boxblur=luma_radius={luma_rad}:luma_power=2[{v_blur}]")
+            v_filters.append(f"[{split_base}][{v_blur}]overlay={x_px}:{y_px}[{next_label}]")
+            cur_label = next_label
+
+    # 2. Khắc phụ đề Subtitle Burn (Subtitle Layer - LUÔN nằm trên Mask)
+    if has_sub:
+        if ass_subtitle_path and ass_subtitle_path.exists():
+            ass_posix = ass_subtitle_path.resolve().as_posix().replace(":", "\\:")
+            v_filters.append(f"[{cur_label}]ass='{ass_posix}'[vout]")
+            cur_label = "vout"
+        elif srt_subtitle_path and srt_subtitle_path.exists():
+            srt_posix = srt_subtitle_path.resolve().as_posix().replace(":", "\\:")
+            v_filters.append(f"[{cur_label}]subtitles='{srt_posix}'[vout]")
+            cur_label = "vout"
+    else:
+        if v_filters:
+            v_filters.append(f"[{cur_label}]null[vout]")
+            cur_label = "vout"
+
+    return ";".join(v_filters), cur_label
+
+
 async def render_final_video(
     input_video_path: Path,
     original_audio_path: Optional[Path],
@@ -77,13 +155,15 @@ async def render_final_video(
     srt_subtitle_path: Optional[Path] = None,
     ass_subtitle_path: Optional[Path] = None,
     subtitle_style: Optional[Dict[str, Any]] = None,
+    mask_regions: Optional[List[Dict[str, Any]]] = None,
     keep_background_audio: bool = True,
     background_volume: float = 0.15,
     voice_volume: float = 1.0,
     burn_subtitles: bool = False,
 ) -> Dict[str, Any]:
     """
-    Kết hợp Video gốc + AI Voice Track (48kHz) + Original Background Audio (48kHz) + Phụ đề ASS/SRT.
+    Kết hợp Video gốc + Mask/Blur Regions + Phụ đề ASS/SRT + AI Voice Track (48kHz) + Background Audio (48kHz).
+    - Áp dụng Mask Layer trước, Subtitle Burn sau (Z-order chuẩn).
     - Áp dụng Loudness Normalization (loudnorm) chống clipping.
     - Xuất video chuẩn H.264 + AAC 48,000 Hz Stereo 192 kbps.
     """
@@ -95,10 +175,12 @@ async def render_final_video(
     output_video_path.parent.mkdir(parents=True, exist_ok=True)
     video_info = await probe_media_file(input_video_path)
     expected_duration = float(video_info.get("duration") or 0.0)
+    video_w = int(video_info.get("width") or 1920)
+    video_h = int(video_info.get("height") or 1080)
 
     logger.info(
         f"Bắt đầu render video 48kHz Stereo: {output_video_path.name} "
-        f"(burn_subs={burn_subtitles}, keep_bg={keep_background_audio}, bg_vol={background_volume:.2f}, voice_vol={voice_volume:.2f})"
+        f"(burn_subs={burn_subtitles}, masks={len(mask_regions or [])}, keep_bg={keep_background_audio}, bg_vol={background_volume:.2f}, voice_vol={voice_volume:.2f})"
     )
 
     cmd = ["ffmpeg", "-y"]
@@ -111,75 +193,97 @@ async def render_final_video(
     if has_bg:
         cmd.extend(["-i", str(original_audio_path.resolve())])   # Input 2: Original Audio (48kHz)
 
-    # 2. Xử lý Video Filter (Burn Styled ASS vs SRT vs Stream Copy)
-    if burn_subtitles:
-        sub_filter = None
-        if ass_subtitle_path and ass_subtitle_path.exists():
-            ass_posix = ass_subtitle_path.resolve().as_posix().replace(":", "\\:")
-            sub_filter = f"ass='{ass_posix}'"
-        elif srt_subtitle_path and srt_subtitle_path.exists():
-            srt_posix = srt_subtitle_path.resolve().as_posix().replace(":", "\\:")
-            # Cấu hình force_style từ SubtitleStyle
-            style = subtitle_style or {}
-            fn = style.get("font_family") or "Arial"
-            fs = int(style.get("font_size") or 22)
-            sub_filter = (
-                f"subtitles='{srt_posix}':force_style="
-                f"'FontName={fn},FontSize={fs},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,MarginV=35'"
-            )
-
-        if sub_filter:
-            video_codec_args = [
-                "-vf", sub_filter,
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "22",
-                "-pix_fmt", "yuv420p"
-            ]
-        else:
-            video_codec_args = ["-c:v", "copy"]
-    else:
-        # Không cần re-encode video nếu không burn phụ đề -> Stream copy siêu nhanh
-        video_codec_args = ["-c:v", "copy"]
+    # 2. Xử lý Video Filter Graph (Mask Layer -> Subtitle Layer)
+    video_filter_str, vout_label = build_video_filter_graph(
+        mask_regions=mask_regions,
+        burn_subtitles=burn_subtitles,
+        ass_subtitle_path=ass_subtitle_path,
+        srt_subtitle_path=srt_subtitle_path,
+        subtitle_style=subtitle_style,
+        video_width=video_w,
+        video_height=video_h,
+    )
 
     # 3. Xử lý Audio Filter (Mix 48kHz + Loudness Normalization chống clipping)
     if has_bg:
-        filter_complex = (
+        audio_filter_str = (
             f"[2:a]volume={background_volume:.2f}[bg];"
             f"[1:a]volume={voice_volume:.2f}[dub];"
             f"[bg][dub]amix=inputs=2:duration=first:dropout_transition=2[mixed];"
             f"[mixed]loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
         )
     else:
-        filter_complex = (
+        audio_filter_str = (
             f"[1:a]volume={voice_volume:.2f}[dub];"
             f"[dub]loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
         )
 
+    # 4. Tổ hợp Filter Complex
+    if video_filter_str:
+        combined_filter = f"{video_filter_str};{audio_filter_str}"
+        codec_args = [
+            "-filter_complex", combined_filter,
+            "-map", f"[{vout_label}]",
+            "-map", "[aout]",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "22",
+            "-pix_fmt", "yuv420p",
+        ]
+    else:
+        # Không có mask và không burn sub -> Stream copy video
+        codec_args = [
+            "-filter_complex", audio_filter_str,
+            "-map", "0:v:0",
+            "-map", "[aout]",
+            "-c:v", "copy",
+        ]
+
     audio_codec_args = [
-        "-filter_complex", filter_complex,
-        "-map", "0:v:0",
-        "-map", "[aout]",
         "-c:a", FINAL_AUDIO_CODEC,
         "-b:a", FINAL_AUDIO_BITRATE,
         "-ar", str(FINAL_AUDIO_SAMPLE_RATE),
         "-ac", str(FINAL_AUDIO_CHANNELS),
     ]
 
-    # Gộp toàn bộ lệnh FFmpeg
-    cmd.extend(video_codec_args)
-    cmd.extend(audio_codec_args)
-    cmd.append(str(output_video_path.resolve()))
+    # 5. Gộp toàn bộ lệnh FFmpeg render ra file staging tạm (.processing.mp4)
+    staging_video_path = output_video_path.with_name(f"{output_video_path.stem}.processing{output_video_path.suffix}")
+    if staging_video_path.exists():
+        staging_video_path.unlink(missing_ok=True)
 
-    timeout = 600 if burn_subtitles else 240
+    cmd.extend(codec_args)
+    cmd.extend(audio_codec_args)
+    cmd.append(str(staging_video_path.resolve()))
+
+    timeout = 600 if (burn_subtitles or video_filter_str) else 240
     ret, _, err = await run_command_async(cmd, timeout=timeout)
 
     if ret != 0:
+        if staging_video_path.exists():
+            staging_video_path.unlink(missing_ok=True)
         logger.error(f"Render video thất bại: {err}")
         raise RuntimeError(f"Lỗi khi render video hoàn chỉnh: {err}")
 
-    # Hậu kiểm chất lượng video và audio sau khi render
-    validation = await validate_final_render(output_video_path, expected_duration)
+    # Hậu kiểm chất lượng video và audio trên file staging trước khi commit
+    try:
+        validation = await validate_final_render(staging_video_path, expected_duration)
+    except Exception as ve:
+        if staging_video_path.exists():
+            staging_video_path.unlink(missing_ok=True)
+        raise ve
+
+    # Atomic replace file staging sang output_video_path chính thức
+    import os, shutil
+    for attempt in range(5):
+        try:
+            os.replace(str(staging_video_path), str(output_video_path))
+            break
+        except (PermissionError, OSError):
+            if attempt == 4:
+                shutil.copy2(str(staging_video_path), str(output_video_path))
+                staging_video_path.unlink(missing_ok=True)
+            else:
+                await asyncio.sleep(0.05 * (attempt + 1))
 
     return {
         "output_video_path": str(output_video_path),

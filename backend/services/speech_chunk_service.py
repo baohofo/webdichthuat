@@ -13,14 +13,22 @@ from backend.config import (
 logger = logging.getLogger("speech_chunk_service")
 
 # Regex nhận diện kết thúc câu
-SENTENCE_TERMINATORS = re.compile(r"[.!?…]+$")
+SENTENCE_TERMINATORS = re.compile(r"(?<!\.)[.!?]+$")
+ELLIPSIS_TERMINATORS = re.compile(r"(\.{3,}|…)+$")
 CLAUSE_TERMINATORS = re.compile(r"[,;:]+$")
+LEADING_CONTINUATION = re.compile(r"^(\.{2,}|…|\s|,)+")
 
 
 def is_sentence_ending(text: str) -> bool:
-    """Kiểm tra văn bản có kết thúc bằng dấu chấm, hỏi, than không."""
+    """Kiểm tra văn bản có kết thúc bằng dấu chấm, hỏi, than (không tính ellipsis thuần túy) không."""
     clean = text.strip()
     return bool(SENTENCE_TERMINATORS.search(clean))
+
+
+def is_ellipsis_ending(text: str) -> bool:
+    """Kiểm tra văn bản có kết thúc bằng dấu ba chấm lửng (...) hay (…)."""
+    clean = text.strip()
+    return bool(ELLIPSIS_TERMINATORS.search(clean))
 
 
 def is_clause_ending(text: str) -> bool:
@@ -29,13 +37,46 @@ def is_clause_ending(text: str) -> bool:
     return bool(CLAUSE_TERMINATORS.search(clean))
 
 
+def is_continuation_fragment(prev_text: str, next_text: str) -> bool:
+    """
+    Nhận diện fragment tiếp theo có phải là phần nối tiếp trực tiếp của câu trước hay không:
+    - Câu trước kết thúc bằng '...' hoặc '…' và câu sau bắt đầu bằng '...' hoặc chữ thường.
+    - Hoặc câu trước chưa kết thúc dấu câu và câu sau là từ nối.
+    """
+    clean_prev = prev_text.strip()
+    clean_next = next_text.strip()
+    if not clean_prev or not clean_next:
+        return False
+
+    prev_has_ellipsis = is_ellipsis_ending(clean_prev)
+    next_has_leading_ellipsis = bool(LEADING_CONTINUATION.search(clean_next))
+
+    # Nếu A có '...' và B có leading '...' -> chắc chắn là continuation
+    if prev_has_ellipsis and next_has_leading_ellipsis:
+        return True
+
+    # Nếu A có '...' và B bắt đầu bằng chữ thường
+    first_char = clean_next[0]
+    if prev_has_ellipsis and (first_char.islower() or first_char in {",", ";"}):
+        return True
+
+    # Nếu A không có dấu ngắt câu nào và B bắt đầu bằng chữ thường
+    if not is_sentence_ending(clean_prev) and not is_clause_ending(clean_prev) and not prev_has_ellipsis:
+        if first_char.islower():
+            return True
+
+    return False
+
+
 def get_trailing_punctuation(text: str) -> str:
     """Trích xuất ký tự dấu câu ở cuối chuỗi."""
     clean = text.strip()
     if not clean:
         return ""
+    if is_ellipsis_ending(clean):
+        return "…"
     last_char = clean[-1]
-    if last_char in {".", "!", "?", "…"}:
+    if last_char in {".", "!", "?"}:
         return last_char
     if last_char in {",", ";", ":"}:
         return last_char
@@ -93,13 +134,62 @@ def _split_oversized_segment(seg: Dict[str, Any], target_max_dur: float = SOFT_M
     return sub_segs
 
 
+def merge_continuation_speech_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Gộp các SpeechChunks liền kề nếu chúng là 2 vế của một câu liên tục bị tách vụn
+    bởi dấu ba chấm lửng (...) hoặc continuation marker, khi gap nhỏ và tổng thời lượng <= 9.0s.
+    """
+    if not chunks:
+        return []
+
+    merged: List[Dict[str, Any]] = []
+
+    for chunk in chunks:
+        if not merged:
+            merged.append(chunk)
+            continue
+
+        prev = merged[-1]
+        prev_end = float(prev.get("end", 0.0))
+        curr_start = float(chunk.get("start", prev_end))
+        gap = max(0.0, curr_start - prev_end)
+        combined_dur = float(chunk.get("end", curr_start + 1.0)) - float(prev.get("start", 0.0))
+
+        prev_text = prev.get("original_text", "").strip()
+        curr_text = chunk.get("original_text", "").strip()
+
+        # Kiểm tra điều kiện continuation
+        if is_continuation_fragment(prev_text, curr_text) and gap <= CHUNK_MERGE_MAX_GAP and combined_dur <= HARD_MAX_CHUNK_DURATION:
+            # Gộp vào chunk trước
+            clean_prev = re.sub(r"(\.{2,}|…|\s)+$", "", prev_text)
+            clean_curr = re.sub(r"^(\.{2,}|…|\s)+", "", curr_text)
+            joined_text = f"{clean_prev} {clean_curr}".strip()
+
+            prev["end"] = chunk.get("end", curr_start + 1.0)
+            prev["duration"] = round(float(prev["end"]) - float(prev["start"]), 2)
+            prev["original_text"] = joined_text
+            prev["punctuation_end"] = get_trailing_punctuation(joined_text)
+            prev["is_complete_sentence"] = is_sentence_ending(joined_text)
+            prev["original_whisper_indices"] = list(set(prev.get("original_whisper_indices", []) + chunk.get("original_whisper_indices", [])))
+            prev["words"] = prev.get("words", []) + chunk.get("words", [])
+            continue
+
+        merged.append(chunk)
+
+    # Re-index
+    for idx, c in enumerate(merged, start=1):
+        c["index"] = idx
+
+    return merged
+
+
 def build_speech_chunks_from_stt(
     whisper_segments: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
     Gom nhóm (Semantic Chunking) các Whisper segments thành các SpeechChunk hoàn chỉnh cho TTS:
     - Ưu tiên thứ tự: Sentence boundary -> Semantic relation -> Original gap -> Max duration
-    - Không cắt vụn câu chỉ vì Whisper sinh nhiều segment nhỏ.
+    - Nhận diện continuation marker: không cắt vụn câu khi có '...' nối vế.
     - Câu ngắn độc lập hoàn chỉnh ('Đúng vậy.', 'Không.') vẫn được bảo lưu.
     - Điểm cắt ưu tiên trong khoảng 2.0 - 6.0s, soft max 7.0s, hard max 9.0s.
     """
@@ -174,6 +264,7 @@ def build_speech_chunks_from_stt(
         prev_text = prev_seg.get("original_text", "").strip()
         prev_is_sentence_end = is_sentence_ending(prev_text)
         prev_is_clause_end = is_clause_ending(prev_text)
+        is_continuation = is_continuation_fragment(prev_text, seg_text)
 
         # Kiểm tra điều kiện ngắt chunk
         should_split = False
@@ -181,10 +272,13 @@ def build_speech_chunks_from_stt(
         # 1. Nếu đạt Hard Max (>= 9.0s) -> Bắt buộc ngắt
         if potential_duration >= HARD_MAX_CHUNK_DURATION:
             should_split = True
-        # 2. Nếu đạt Soft Max (>= 7.0s) và segment trước có dấu ngắt ý (chấm hoặc phẩy)
+        # 2. Nếu là continuation và chưa vượt hard max -> Giữ lại không split
+        elif is_continuation and potential_duration < HARD_MAX_CHUNK_DURATION:
+            should_split = False
+        # 3. Nếu đạt Soft Max (>= 7.0s) và segment trước có dấu ngắt ý (chấm hoặc phẩy)
         elif potential_duration >= SOFT_MAX_CHUNK_DURATION and (prev_is_sentence_end or prev_is_clause_end or gap > 0.3):
             should_split = True
-        # 3. Nếu segment trước kết thúc câu hoàn chỉnh (. ! ?)
+        # 4. Nếu segment trước kết thúc câu hoàn chỉnh (. ! ?)
         elif prev_is_sentence_end:
             current_dur = prev_end - chunk_start
             # Nếu câu trước đã đạt thời lượng tối thiểu hoặc có khoảng nghỉ rõ ràng
@@ -193,7 +287,7 @@ def build_speech_chunks_from_stt(
             # Nếu là câu ngắn nhưng độc lập (ví dụ "Yes.", "No.", "Right.") và có khoảng cách
             elif gap >= 0.35:
                 should_split = True
-        # 4. Nếu khoảng nghỉ gốc quá lớn (> 0.8s) -> Thường là chuyển cảnh/ngừng lời
+        # 5. Nếu khoảng nghỉ gốc quá lớn (> 0.8s) -> Thường là chuyển cảnh/ngừng lời
         elif gap > 0.8:
             should_split = True
 
@@ -206,9 +300,12 @@ def build_speech_chunks_from_stt(
     # Đóng chunk cuối cùng nếu còn
     _flush_current_chunk()
 
+    # Chạy qua bộ gộp continuation chunks sau cùng để làm sạch triệt để
+    final_chunks = merge_continuation_speech_chunks(chunks)
+
     logger.info(
-        f"✓ Semantic Chunking hoàn tất: {len(whisper_segments)} Whisper segments -> {len(chunks)} SpeechChunks "
-        f"(Avg chunk duration: {round(sum(c['duration'] for c in chunks) / max(1, len(chunks)), 2)}s)"
+        f"✓ Semantic Chunking hoàn tất: {len(whisper_segments)} Whisper segments -> {len(final_chunks)} SpeechChunks "
+        f"(Avg chunk duration: {round(sum(c['duration'] for c in final_chunks) / max(1, len(final_chunks)), 2)}s)"
     )
 
-    return chunks
+    return final_chunks

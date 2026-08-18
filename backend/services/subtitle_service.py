@@ -440,39 +440,34 @@ def generate_ass_content(
 ) -> str:
     """
     Tạo nội dung file phụ đề ASS chuẩn xác từ cấu hình SubtitleStyle và danh sách phụ đề.
-    Hỗ trợ định vị trực tiếp tọa độ tương đối (position_x, position_y) qua override tag {\\an5\\pos(X,Y)}.
+    Hỗ trợ định vị trực tiếp tọa độ tương đối (position_x, position_y, width, height) qua override tag {\\an5\\pos(X,Y)} và lề MarginL/MarginR.
     """
     style = subtitle_style or {}
     font_family = style.get("font_family") or "Arial"
-    font_size = int(style.get("font_size") or 42)
+    font_size = int(style.get("font_size") or 36)
     primary_color = hex_to_ass_color(style.get("primary_color") or "#FFFFFF")
     outline_color = hex_to_ass_color(style.get("outline_color") or "#000000")
     outline_width = float(style.get("outline_width") if style.get("outline_width") is not None else 2.5)
     shadow = float(style.get("shadow") if style.get("shadow") is not None else 1.0)
     bold = -1 if style.get("bold", True) else 0
 
-    # Tọa độ tương đối trực tiếp (0.0 đến 1.0) từ giao diện kéo thả
-    pos_x_ratio = style.get("position_x")
-    pos_y_ratio = style.get("position_y")
+    # Tọa độ và kích thước tương đối trực tiếp (0.0 đến 1.0) từ giao diện kéo thả & resize
+    pos_x_ratio = float(style.get("position_x") if style.get("position_x") is not None else 0.50)
+    pos_y_ratio = float(style.get("position_y") if style.get("position_y") is not None else 0.88)
+    width_ratio = float(style.get("width") if style.get("width") is not None else 0.70)
+    height_ratio = float(style.get("height") if style.get("height") is not None else 0.15)
 
-    has_relative_pos = pos_x_ratio is not None and pos_y_ratio is not None
-    if has_relative_pos:
-        pos_x = int(round(float(pos_x_ratio) * play_res_x))
-        pos_y = int(round(float(pos_y_ratio) * play_res_y))
-        pos_tag = f"{{\\an5\\pos({pos_x},{pos_y})}}"
-        alignment = 5
-        margin_v = 0
-    else:
-        align_map = {
-            "bottom_center": 2,
-            "bottom_left": 1,
-            "bottom_right": 3,
-            "middle_center": 5,
-            "top_center": 8,
-        }
-        alignment = align_map.get(str(style.get("alignment", "bottom_center")), 2)
-        margin_v = int(style.get("margin_v") if style.get("margin_v") is not None else (style.get("margin_bottom") or 60))
-        pos_tag = ""
+    pos_x = int(round(pos_x_ratio * play_res_x))
+    pos_y = int(round(pos_y_ratio * play_res_y))
+    box_w = int(round(width_ratio * play_res_x))
+    box_h = int(round(height_ratio * play_res_y))
+
+    margin_l = max(10, pos_x - box_w // 2)
+    margin_r = max(10, play_res_x - (pos_x + box_w // 2))
+    margin_v = max(10, play_res_y - (pos_y + box_h // 2))
+
+    pos_tag = f"{{\\an5\\pos({pos_x},{pos_y})}}"
+    alignment = 5
 
     ass_header = f"""[Script Info]
 Title: AI Dubbing Studio Subtitles
@@ -485,7 +480,7 @@ PlayResY: {play_res_y}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font_family},{font_size},{primary_color},&H000000FF&,{outline_color},&H80000000&,{bold},0,0,0,100,100,0,0,1,{outline_width},{shadow},{alignment},30,30,{margin_v},1
+Style: Default,{font_family},{font_size},{primary_color},&H000000FF&,{outline_color},&H80000000&,{bold},0,0,0,100,100,0,0,1,{outline_width},{shadow},{alignment},{margin_l},{margin_r},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -543,3 +538,112 @@ async def save_ass_file(
 
     logger.info(f"✓ Đã lưu file phụ đề ASS: {output_ass_path.name}")
     return output_ass_path
+
+
+import json
+from backend.utils.file_utils import get_job_paths
+from backend.utils.job_store import load_job_info_sync, save_job_info_atomic_sync
+
+
+async def ensure_subtitle_artifact(
+    job_id: str,
+    job_paths: Optional[Dict[str, Path]] = None,
+    subtitle_type: str = "translated",
+) -> Path:
+    """
+    Bảo đảm file phụ đề canonical (.srt) luôn tồn tại và hợp lệ:
+    - subtitle_type = 'translated' -> sinh / kiểm tra translated.srt từ translated_transcript.json
+    - subtitle_type = 'original'   -> sinh / kiểm tra original.srt từ transcript.json
+    - TUYỆT ĐỐI KHÔNG GỌI LẠI GEMINI/WHISPER (Gemini API calls = 0).
+    - Cập nhật atomic metadata artifacts vào job_info.json.
+    """
+    if not job_paths:
+        job_paths = get_job_paths(job_id)
+        if not job_paths:
+            raise FileNotFoundError(f"Job '{job_id}' không tồn tại.")
+
+    sub_type = "original" if str(subtitle_type).lower() in ["original", "goc", "source"] else "translated"
+    filename_base = "original" if sub_type == "original" else "translated"
+    srt_file = job_paths["subtitles_dir"] / f"{filename_base}.srt"
+    ass_file = job_paths["subtitles_dir"] / f"{filename_base}.ass"
+
+    if srt_file.exists() and srt_file.stat().st_size > 0:
+        return srt_file
+
+    trans_file = job_paths["transcript_dir"] / "translated_transcript.json"
+    stt_file = job_paths["transcript_dir"] / "transcript.json"
+
+    segments_to_use = []
+    if sub_type == "translated":
+        if trans_file.exists():
+            try:
+                async with aiofiles.open(trans_file, "r", encoding="utf-8") as f:
+                    data = json.loads(await f.read())
+                    segments_to_use = data.get("speech_chunks") or data.get("segments", [])
+            except Exception as e:
+                logger.warning(f"Lỗi đọc {trans_file.name}: {e}")
+
+        if not segments_to_use and stt_file.exists():
+            try:
+                async with aiofiles.open(stt_file, "r", encoding="utf-8") as f:
+                    data = json.loads(await f.read())
+                    segments_to_use = data.get("speech_chunks") or data.get("segments", [])
+            except Exception as e:
+                logger.warning(f"Lỗi đọc {stt_file.name}: {e}")
+    else:
+        # Original subtitles
+        if stt_file.exists():
+            try:
+                async with aiofiles.open(stt_file, "r", encoding="utf-8") as f:
+                    data = json.loads(await f.read())
+                    raw_chunks = data.get("speech_chunks") or data.get("segments", [])
+                    # Đảm bảo dùng original_text
+                    for c in raw_chunks:
+                        segments_to_use.append({
+                            **c,
+                            "translated_text": c.get("original_text") or c.get("text", ""),
+                        })
+            except Exception as e:
+                logger.warning(f"Lỗi đọc {stt_file.name}: {e}")
+
+    if not segments_to_use:
+        raise FileNotFoundError(
+            f"Không tìm thấy dữ liệu phụ đề ({sub_type}) cho Job '{job_id}'."
+        )
+
+    # Sinh file SRT và ASS từ segments có sẵn (0 API calls)
+    _, valid_subs, summary = await save_srt_file(segments_to_use, srt_file)
+    try:
+        await save_ass_file(valid_subs, ass_file)
+    except Exception:
+        pass
+
+    # Cập nhật metadata artifact vào job_info.json
+    try:
+        job_info = load_job_info_sync(job_id)
+        if job_info:
+            artifacts = job_info.setdefault("artifacts", {})
+            out_rev = job_info.get("output_revision", 1)
+            art_key = f"{sub_type}_subtitle"
+            artifacts[art_key] = {
+                "available": True,
+                "path": str(srt_file),
+                "format": "srt",
+                "count": len(valid_subs),
+                "revision": out_rev,
+            }
+            if sub_type == "translated":
+                job_info["subtitles_summary"] = summary
+            save_job_info_atomic_sync(job_id, job_info)
+    except Exception as e:
+        logger.warning(f"Lỗi cập nhật artifact {sub_type}_subtitle vào job_info: {e}")
+
+    logger.info(f"✓ Đã tự động tạo và bảo đảm canonical SRT artifact: {srt_file.name} ({len(valid_subs)} phụ đề)")
+    return srt_file
+
+
+async def ensure_translated_srt_artifact(
+    job_id: str,
+    job_paths: Optional[Dict[str, Path]] = None,
+) -> Path:
+    return await ensure_subtitle_artifact(job_id, job_paths, subtitle_type="translated")

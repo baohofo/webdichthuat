@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import aiofiles
@@ -8,18 +9,35 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 from backend.config import (
     ALLOWED_VIDEO_EXTENSIONS,
     FINAL_AUDIO_SAMPLE_RATE,
     MAX_UPLOAD_SIZE_BYTES,
+    RUNTIME_INSTANCE_ID,
     WHISPER_AUDIO_SAMPLE_RATE,
     WHISPER_DEFAULT_MODEL,
 )
-from backend.services.audio_sync_service import sync_and_combine_voice_track
+from backend.services.audio_sync_service import (
+    AudioSyncError,
+    normalize_audio_sync_result,
+    reconstruct_tts_segments_from_disk,
+    sync_and_combine_voice_track,
+    validate_audio_sync_segments,
+)
 from backend.services.render_service import render_final_video
 from backend.services.speech_chunk_service import build_speech_chunks_from_stt
+from backend.services.speech_continuity_service import analyze_speech_continuity
 from backend.services.stt_service import transcribe_audio
-from backend.services.subtitle_service import save_ass_file, save_srt_file
+from backend.services.subtitle_service import (
+    ensure_subtitle_artifact,
+    ensure_translated_srt_artifact,
+    save_ass_file,
+    save_srt_file,
+)
 from backend.services.translation_service import translate_transcript_segments
 from backend.services.tts_service import (
     generate_all_segments,
@@ -40,17 +58,28 @@ from backend.utils.file_utils import (
     sanitize_filename,
 )
 from backend.utils.job_store import (
+    CANONICAL_STAGE_ORDER,
+    compute_dirty_stages,
     create_initial_job_state,
     delete_job,
     get_all_jobs_summary,
     load_job_info,
+    prepare_job_for_reprocess,
+    register_active_task,
     reset_failed_stages_for_retry,
     save_job_info_atomic,
     start_stage,
+    unregister_active_task,
     update_stage_progress,
+    update_stage_retry,
     complete_stage,
     fail_stage,
     skip_stage,
+)
+from backend.utils.retry_utils import (
+    execute_with_auto_retry,
+    is_fatal_api_key_error,
+    is_recoverable_error,
 )
 from backend.utils.batch_store import (
     create_batch,
@@ -60,16 +89,33 @@ from backend.utils.batch_store import (
 )
 
 # Schemas Pydantic
+class MaskRegionModel(BaseModel):
+    id: str
+    x: float = 0.10          # Normalized 0.0 - 1.0 (Top-Left x)
+    y: float = 0.75          # Normalized 0.0 - 1.0 (Top-Left y)
+    width: float = 0.80      # Normalized 0.0 - 1.0
+    height: float = 0.15     # Normalized 0.0 - 1.0
+    type: str = "blur"       # "blur" | "solid"
+    blur_strength: int = 15  # 1 - 30
+    color: str = "#000000"
+    opacity: float = 0.85
+    enabled: bool = True
+    locked: bool = False
+
 class SubtitleStyleModel(BaseModel):
     font_family: str = "Arial"
-    font_size: int = 42
+    font_size: int = 36
     primary_color: str = "#FFFFFF"
     outline_color: str = "#000000"
     outline_width: float = 2.5
     alignment: str = "bottom_center"
     margin_v: int = 60
-    position_x: float = 0.50  # Normalized 0.0 - 1.0 (Center = 0.50)
-    position_y: float = 0.88  # Normalized 0.0 - 1.0 (Bottom-ish = 0.88)
+    position_x: float = 0.50  # Normalized Center X (0.0 - 1.0)
+    position_y: float = 0.88  # Normalized Center Y (0.0 - 1.0)
+    width: float = 0.70       # Normalized Bounding Box Width (0.05 - 1.0)
+    height: float = 0.15      # Normalized Bounding Box Height (0.05 - 1.0)
+    box_x: Optional[float] = None
+    box_y: Optional[float] = None
     bold: bool = True
     shadow: float = 1.0
 
@@ -99,6 +145,7 @@ class DubAndRenderRequest(BaseModel):
     voice_volume: float = 1.0
     burn_subtitles: bool = False
     subtitle_style: Optional[SubtitleStyleModel] = None
+    mask_regions: Optional[List[MaskRegionModel]] = None
 
 class PipelineProcessRequest(BaseModel):
     run_stt: bool = True
@@ -123,6 +170,7 @@ class PipelineProcessRequest(BaseModel):
     whisper_model: str = "small"
     api_key: Optional[str] = None
     subtitle_style: Optional[SubtitleStyleModel] = None
+    mask_regions: Optional[List[MaskRegionModel]] = None
 
 class RetryRequest(BaseModel):
     resume_from_failed: bool = True
@@ -325,6 +373,7 @@ async def _handle_single_video_upload(file: UploadFile) -> Dict[str, Any]:
 
 
 @router.post("/upload")
+@router.post("/jobs/upload")
 async def upload_video(file: UploadFile = File(...)) -> Dict[str, Any]:
     return await _handle_single_video_upload(file)
 
@@ -354,6 +403,7 @@ async def get_job_details(job_id: str) -> Dict[str, Any]:
     # 1. Nạp segments từ translated_transcript.json hoặc transcript.json
     trans_file = job_paths["transcript_dir"] / "translated_transcript.json"
     stt_file = job_paths["transcript_dir"] / "transcript.json"
+    srt_file = job_paths["subtitles_dir"] / "translated.srt"
 
     if trans_file.exists():
         try:
@@ -366,6 +416,12 @@ async def get_job_details(job_id: str) -> Dict[str, Any]:
                     "count": len(chunks),
                     "target_language": t_data.get("target_language", "vi"),
                     "translation_style": t_data.get("translation_style", "standard_dubbing"),
+                }
+                artifacts["translated_subtitle"] = {
+                    "available": True,
+                    "path": str(srt_file),
+                    "format": "srt",
+                    "count": len(chunks),
                 }
         except Exception as e:
             logger.warning(f"Lỗi nạp translated_transcript.json cho job {job_id}: {e}")
@@ -380,29 +436,43 @@ async def get_job_details(job_id: str) -> Dict[str, Any]:
 
     # 2. Nạp artifact và video object cho final_video nếu render hoàn tất
     output_mp4 = job_paths["output_dir"] / "final_dubbed.mp4"
-    srt_file = job_paths["subtitles_dir"] / "translated.srt"
-    is_rendered = job_info.get("stages", {}).get("render", {}).get("status") == "completed" and output_mp4.exists() and output_mp4.stat().st_size > 0
+    render_st = job_info.get("stages", {}).get("render", {})
+    is_rendered = render_st.get("status") == "completed" and output_mp4.exists() and output_mp4.stat().st_size > 0
+    is_reprocessing = (job_info.get("status") == "processing" or render_st.get("status") in ["running", "pending"]) and artifacts.get("final_video", {}).get("available")
+    out_rev = job_info.get("output_revision", 1 if is_rendered else 0)
+
+    has_subtitles = (srt_file.exists() and srt_file.stat().st_size > 0) or trans_file.exists()
 
     if is_rendered:
         render_res = job_info.get("render_result", {})
         file_size = output_mp4.stat().st_size
         final_video_meta = {
             "available": True,
+            "current": True,
+            "reprocessing": False,
+            "revision": out_rev,
             "filename": output_mp4.name,
             "duration": render_res.get("duration"),
             "duration_formatted": render_res.get("duration_formatted"),
             "size": format_file_size(render_res.get("size_bytes", file_size)),
             "size_bytes": render_res.get("size_bytes", file_size),
             "resolution": render_res.get("resolution"),
-            "video_url": f"/api/jobs/{job_id}/result/video",
-            "download_video_url": f"/api/jobs/{job_id}/download/video",
-            "download_srt_url": f"/api/jobs/{job_id}/download/subtitle" if srt_file.exists() else None,
+            "video_url": f"/api/jobs/{job_id}/result/video?v={out_rev}",
+            "download_video_url": f"/api/jobs/{job_id}/download/video?v={out_rev}",
+            "download_srt_url": f"/api/jobs/{job_id}/download/subtitle?v={out_rev}" if has_subtitles else None,
             "video_codec": "h264",
             "audio_codec": "aac",
             "audio_sample_rate": 48000,
         }
         job_info["video"] = final_video_meta
         artifacts["final_video"] = final_video_meta
+    elif is_reprocessing:
+        if "final_video" in artifacts:
+            artifacts["final_video"]["current"] = False
+            artifacts["final_video"]["reprocessing"] = True
+        if "video" in job_info and isinstance(job_info["video"], dict):
+            job_info["video"]["current"] = False
+            job_info["video"]["reprocessing"] = True
 
     return job_info
 
@@ -477,17 +547,51 @@ async def retry_job(
     )
     req_obj = PipelineProcessRequest(**cfg_dict) if cfg_dict else PipelineProcessRequest()
 
-    background_tasks.add_task(execute_pipeline_core, job_id, req_obj)
+    retry_plan = updated_job.get("retry_plan", {})
+    resume_stage = retry_plan.get("resume_stage", "extract_audio") if retry_req.resume_from_failed else "extract_audio"
+
+    # TEST 8: Error handling & Background task scheduling failure protection
+    try:
+        background_tasks.add_task(
+            execute_pipeline_core,
+            job_id,
+            req_obj,
+            resume_stage,
+            retry_plan,
+        )
+    except Exception as e:
+        await fail_stage(
+            job_id,
+            resume_stage,
+            "RETRY_SCHEDULE_FAILED",
+            f"Không thể lên lịch thử lại tác vụ: {str(e)}",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"RETRY_SCHEDULE_FAILED: {str(e)}",
+        )
 
     mode_str = "tiếp tục từ đoạn lỗi" if retry_req.resume_from_failed else "chạy lại từ đầu"
+    stages = updated_job.get("stages", {})
+
     return {
         "success": True,
+        "accepted": True,
+        "mode": "resume" if retry_req.resume_from_failed else "full",
+        "failed_stage": retry_plan.get("failed_stage"),
+        "resume_stage": resume_stage,
+        "retry_scope": retry_plan.get("retry_scope"),
+        "preserve_upstream": retry_plan.get("preserve_upstream", False),
+        "preserved_stages": retry_plan.get("preserved_stages", []),
+        "execution_plan": retry_plan.get("execution_plan", CANONICAL_STAGE_ORDER),
         "message": f"Đang khởi chạy lại Job '{job_id}' ({mode_str}).",
         "job_id": job_id,
         "status": "processing",
+        "current_stage": resume_stage,
         "retry_started": True,
         "retry_count": updated_job.get("retry_count", 1),
-        "stages": updated_job.get("stages", {}),
+        "stages": stages,
+        "progress": updated_job.get("progress", 0.0),
     }
 
 
@@ -1140,9 +1244,9 @@ async def dub_and_render_video(
 
 
 @router.get("/jobs/{job_id}/result/video")
-async def stream_result_video(job_id: str):
+async def stream_result_video(job_id: str, v: Optional[str] = Query(None)):
     """
-    Stream video thành phẩm cho thẻ <video> trên giao diện web.
+    Stream video thành phẩm cho thẻ <video> trên giao diện web (có Cache-Busting qua query v={output_revision}).
     """
     job_paths = get_job_paths(job_id)
     if not job_paths:
@@ -1152,11 +1256,16 @@ async def stream_result_video(job_id: str):
     if not final_video.exists():
         raise HTTPException(status_code=404, detail="File video hoàn chỉnh chưa được tạo.")
 
-    return FileResponse(final_video, media_type="video/mp4", filename="final_dubbed.mp4")
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    return FileResponse(final_video, media_type="video/mp4", filename="final_dubbed.mp4", headers=headers)
 
 
 @router.get("/jobs/{job_id}/download/video")
-async def download_result_video(job_id: str):
+async def download_result_video(job_id: str, v: Optional[str] = Query(None)):
     """
     Tải file video MP4 hoàn chỉnh về máy người dùng.
     """
@@ -1168,30 +1277,57 @@ async def download_result_video(job_id: str):
     if not final_video.exists():
         raise HTTPException(status_code=404, detail="File video chưa được tạo.")
 
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
     return FileResponse(
         final_video,
         media_type="application/octet-stream",
         filename="final_dubbed.mp4",
+        headers=headers,
     )
 
 
 @router.get("/jobs/{job_id}/download/subtitle")
-async def download_result_subtitle(job_id: str):
+async def download_result_subtitle(
+    job_id: str,
+    type: str = Query("translated"),
+    v: Optional[str] = Query(None),
+):
     """
-    Tải file phụ đề chuẩn .SRT về máy người dùng.
+    Tải file phụ đề chuẩn .SRT về máy người dùng (hỗ trợ cả phụ đề dịch và phụ đề gốc).
+    Tự động bảo đảm canonical SRT artifact tồn tại từ segments mà KHÔNG gọi lại Gemini.
     """
     job_paths = get_job_paths(job_id)
     if not job_paths:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    srt_file = job_paths["subtitles_dir"] / "translated.srt"
-    if not srt_file.exists():
-        raise HTTPException(status_code=404, detail="File phụ đề SRT chưa được tạo.")
+    sub_type = "original" if str(type).lower() in ["original", "goc", "source"] else "translated"
+    filename = "original.srt" if sub_type == "original" else "translated.srt"
 
+    try:
+        srt_file = await ensure_subtitle_artifact(job_id, job_paths, subtitle_type=sub_type)
+    except Exception as e:
+        logger.error(f"Lỗi khi bảo đảm SRT ({sub_type}) cho job {job_id}: {e}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"File phụ đề {filename} chưa được tạo hoặc không tìm thấy dữ liệu bản dịch.",
+        )
+
+    if not srt_file.exists() or srt_file.stat().st_size == 0:
+        raise HTTPException(status_code=404, detail=f"File phụ đề {filename} rỗng hoặc không tồn tại.")
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+    }
     return FileResponse(
         srt_file,
-        media_type="text/plain",
-        filename="translated.srt",
+        media_type="application/x-subrip",
+        filename=filename,
+        headers=headers,
     )
 
 
@@ -1213,14 +1349,14 @@ async def process_job_pipeline(
             detail=f"Không tìm thấy Job có ID '{job_id}'.",
         )
 
-    job_info = await load_job_info(job_id) or create_initial_job_state(job_id)
-
     # 1. Validate Whisper Model
     if request.whisper_model not in VALID_WHISPER_MODELS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"INVALID_WHISPER_MODEL: Model Whisper '{request.whisper_model}' không hợp lệ. Các model hỗ trợ: {', '.join(sorted(VALID_WHISPER_MODELS))}",
         )
+
+    job_info = await load_job_info(job_id) or create_initial_job_state(job_id)
 
     # 2. Double-Start Protection
     if job_info.get("status") == "processing":
@@ -1229,65 +1365,131 @@ async def process_job_pipeline(
             detail="Job đang được xử lý trong một tiến trình khác. Vui lòng chờ hoàn tất.",
         )
 
-    # Xác định các stage enabled vs skipped
-    is_sub_enabled = getattr(request, "subtitle_enabled", True) and request.create_subtitle
-    sub_mode = getattr(request, "subtitle_mode", "burn" if request.burn_subtitles else "none")
-
-    needs_audio = request.run_stt or request.run_translation or request.run_tts or request.render_video
-    needs_stt = request.run_stt or (request.run_translation or request.run_tts or request.render_video or is_sub_enabled)
-    needs_translation = request.run_translation or request.run_tts or (request.render_video and is_sub_enabled)
-    needs_tts = request.run_tts or request.render_video
-    needs_subtitle = is_sub_enabled
-    needs_render = request.render_video
-
-    # Khóa trạng thái Job sang 'processing' và lưu snapshot cấu hình
-    job_info["status"] = "processing"
-    job_info["config_snapshot"] = request.dict()
-
     stages = job_info.setdefault("stages", {})
-    stage_flags = [
-        ("extract_audio", needs_audio),
-        ("stt", needs_stt),
-        ("translation", needs_translation),
-        ("tts", needs_tts),
-        ("audio_sync", needs_tts),
-        ("subtitle", needs_subtitle),
-        ("render", needs_render),
-    ]
+    has_completed_stages = any(s.get("status") == "completed" for s in stages.values())
+    old_config = job_info.get("config_snapshot")
+    new_config = request.dict()
 
-    for s_name, is_enabled in stage_flags:
-        if s_name in stages:
-            if is_enabled:
-                if stages[s_name].get("status") != "completed":
-                    stages[s_name]["status"] = "pending"
-                    stages[s_name]["message"] = "Chờ xử lý"
-            else:
-                stages[s_name]["status"] = "skipped"
-                stages[s_name]["message"] = "Bỏ qua theo tùy chọn"
+    resume_stage = "extract_audio"
+    retry_plan = None
 
-    await save_job_info_atomic(job_id, job_info)
+    if has_completed_stages:
+        # Reprocess / Rerun with dependency resolution
+        dirty_stages = compute_dirty_stages(old_config, new_config, stages)
+        if not dirty_stages:
+            dirty_stages = ["render"]
+
+        updated_job = await prepare_job_for_reprocess(job_id, new_config, dirty_stages)
+        if updated_job:
+            job_info = updated_job
+            retry_plan = updated_job.get("retry_plan", {})
+            resume_stage = retry_plan.get("resume_stage", dirty_stages[0])
+    else:
+        # Initial run
+        is_sub_enabled = getattr(request, "subtitle_enabled", True) and request.create_subtitle
+        needs_audio = request.run_stt or request.run_translation or request.run_tts or request.render_video
+        needs_stt = request.run_stt or (request.run_translation or request.run_tts or request.render_video or is_sub_enabled)
+        needs_translation = request.run_translation or request.run_tts or (request.render_video and is_sub_enabled)
+        needs_tts = request.run_tts or request.render_video
+        needs_subtitle = is_sub_enabled
+        needs_render = request.render_video
+
+        job_info["status"] = "processing"
+        job_info["config_snapshot"] = new_config
+
+        stage_flags = [
+            ("extract_audio", needs_audio),
+            ("stt", needs_stt),
+            ("translation", needs_translation),
+            ("tts", needs_tts),
+            ("audio_sync", needs_tts),
+            ("subtitle", needs_subtitle),
+            ("render", needs_render),
+        ]
+
+        for s_name, is_enabled in stage_flags:
+            if s_name in stages:
+                if is_enabled:
+                    if stages[s_name].get("status") != "completed":
+                        stages[s_name]["status"] = "pending"
+                        stages[s_name]["message"] = "Chờ xử lý"
+                else:
+                    stages[s_name]["status"] = "skipped"
+                    stages[s_name]["message"] = "Bỏ qua theo tùy chọn"
+
+        await save_job_info_atomic(job_id, job_info)
 
     # Đưa tác vụ chạy nền
-    background_tasks.add_task(execute_pipeline_core, job_id, request)
+    background_tasks.add_task(execute_pipeline_core, job_id, request, resume_stage, retry_plan)
 
     return {
         "success": True,
         "message": "Đã bắt đầu tiến trình xử lý pipeline.",
         "job_id": job_id,
         "status": "processing",
+        "resume_stage": resume_stage,
         "stages": job_info.get("stages", {}),
     }
 
 
-async def execute_pipeline_core(job_id: str, request: PipelineProcessRequest) -> Dict[str, Any]:
+async def execute_pipeline_core(
+    job_id: str,
+    request: PipelineProcessRequest,
+    resume_stage: Optional[str] = None,
+    retry_plan: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    Worker thực thi toàn bộ pipeline ngầm trong Background Task.
+    Worker thực thi toàn bộ pipeline ngầm trong Background Task với chính sách Strict RetryPlan & Hard Invariant Guard:
+    - RetryPlan Precedence: Nếu resume_stage="tts", các stage trước đó (extract_audio, stt, translation) bị cấm chạy lại hoàn toàn.
+    - Hard Invariant Guard: assert_stage_allowed ngăn chặn mọi attempt gọi service upstream khi stage_index < resume_index.
+    - CANONICAL_STAGE_ORDER slicing: Chỉ thực thi các stage trong execution_plan.
     """
     job_paths = get_job_paths(job_id)
     if not job_paths:
         return {}
 
     job_info = await load_job_info(job_id) or create_initial_job_state(job_id)
+    job_info["config_snapshot"] = request.dict()
+
+    # 1. Xác định Execution Plan và Hard Invariant Guard
+    effective_retry_plan = retry_plan or job_info.get("retry_plan") or {}
+    if effective_retry_plan.get("execution_plan"):
+        execution_plan = effective_retry_plan["execution_plan"]
+        preserved_stages = effective_retry_plan.get("preserved_stages", [s for s in CANONICAL_STAGE_ORDER if s not in execution_plan])
+        resume_stage_clean = effective_retry_plan.get("resume_stage") or execution_plan[0]
+        resume_idx = effective_retry_plan.get("resume_index", CANONICAL_STAGE_ORDER.index(resume_stage_clean) if resume_stage_clean in CANONICAL_STAGE_ORDER else 0)
+    else:
+        resume_stage_clean = resume_stage or effective_retry_plan.get("resume_stage") or "extract_audio"
+        resume_idx = CANONICAL_STAGE_ORDER.index(resume_stage_clean) if resume_stage_clean in CANONICAL_STAGE_ORDER else 0
+        preserved_stages = CANONICAL_STAGE_ORDER[:resume_idx]
+        execution_plan = CANONICAL_STAGE_ORDER[resume_idx:]
+
+    logger.info(
+        f"[PIPELINE] job_id={job_id} mode={'resume' if resume_idx > 0 else 'full'} "
+        f"failed_stage={retry_plan.get('failed_stage') if retry_plan else None} resume_stage={resume_stage_clean} "
+        f"preserved={preserved_stages} execution_plan={execution_plan}"
+    )
+
+    def assert_stage_allowed(stage_name: str):
+        if stage_name in preserved_stages or stage_name not in execution_plan:
+            err_msg = (
+                f"HARD_GUARD_VIOLATION: Stage '{stage_name}' is in preserved_stages or not in execution_plan "
+                f"and is strictly FORBIDDEN from running when execution plan is {execution_plan}!"
+            )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
+
+    # Helper tạo callback cập nhật realtime khi stage-level retry diễn ra
+    def _make_retry_callbacks(stage_name: str, stage_label: str):
+        async def _on_retry(attempt: int, max_att: int, exc: Exception, wait_sec: float):
+            msg = f"Lỗi tạm thời ({str(exc)[:40]}). Đang tự thử lại {stage_label} (lần {attempt}/{max_att - 1})..."
+            await update_stage_retry(job_id, stage_name, attempt=attempt, max_attempts=max_att, message=msg)
+
+        async def _on_recovered(attempt: int):
+            msg = f"✓ Đã khôi phục. Đang tiếp tục {stage_label}..."
+            await update_stage_progress(job_id, stage_name, message=msg)
+
+        return _on_retry, _on_recovered
 
     # Xác định các stage enabled vs skipped
     is_sub_enabled = getattr(request, "subtitle_enabled", True) and request.create_subtitle
@@ -1301,75 +1503,126 @@ async def execute_pipeline_core(job_id: str, request: PipelineProcessRequest) ->
     needs_render = request.render_video
     should_burn_subs = is_sub_enabled and (sub_mode == "burn" or request.burn_subtitles)
 
-    current_running_stage = "extract_audio"
+    current_running_stage = resume_stage_clean
+    current_task = asyncio.current_task()
+    if current_task:
+        register_active_task(job_id, current_task)
+
+    job_info["worker_instance_id"] = RUNTIME_INSTANCE_ID
+    await save_job_info_atomic(job_id, job_info)
+
     try:
         # Tìm file video đầu vào
         input_video_files = list(job_paths["input_dir"].glob("*"))
         if not input_video_files:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Không tìm thấy file video gốc của Job này.",
+                detail="INPUT_FILE_MISSING: Không tìm thấy file video gốc của Job này.",
             )
         input_video_path = input_video_files[0]
 
-        # -------------------------------------------------------------
-        # STEP 1: Dependency - Trích xuất Dual Audio nếu cần
-        # -------------------------------------------------------------
-        current_running_stage = "extract_audio"
+        # Đường dẫn các artifacts trung gian
         whisper_audio_path = job_paths["audio_dir"] / "whisper.wav"
         original_audio_path = job_paths["audio_dir"] / "original_audio.wav"
+        transcript_path = job_paths["transcript_dir"] / "transcript.json"
+        translated_path = job_paths["transcript_dir"] / "translated_transcript.json"
+        srt_file = job_paths["subtitles_dir"] / "translated.srt"
+        ass_file = job_paths["subtitles_dir"] / "translated.ass"
+        dubbed_voice_wav = job_paths["output_dir"] / "dubbed_voice.wav"
+        output_final_mp4 = job_paths["output_dir"] / f"final_dubbed.{request.output_format}"
 
-        if needs_audio:
-            if not whisper_audio_path.exists() or not original_audio_path.exists():
-                await start_stage(job_id, "extract_audio", "Đang trích xuất Dual Audio 48kHz Stereo & 16kHz Mono...")
-                audio_info = await extract_dual_audio(
-                    video_path=input_video_path,
-                    audio_dir=job_paths["audio_dir"],
-                )
-                job_info["audio_info"] = audio_info
-                await complete_stage(job_id, "extract_audio", "Trích xuất Dual Audio hoàn tất (48kHz Stereo + 16kHz Mono)")
+        raw_segments: List[Dict[str, Any]] = []
+        speech_chunks: List[Dict[str, Any]] = []
+        translated_chunks: List[Dict[str, Any]] = []
+        detected_lang = "en"
+        valid_subs: List[Dict[str, Any]] = []
+        subtitle_summary: Dict[str, Any] = {}
+        tts_segments: List[Dict[str, Any]] = []
+        sync_stats: Dict[str, Any] = {}
+        render_result: Dict[str, Any] = {}
+        pipeline_metrics: Dict[str, Any] = {}
+
+        # -------------------------------------------------------------
+        # STEP 1: Dual Audio Extraction
+        # -------------------------------------------------------------
+        if "extract_audio" in execution_plan:
+            assert_stage_allowed("extract_audio")
+            current_running_stage = "extract_audio"
+            if needs_audio:
+                if not whisper_audio_path.exists() or not original_audio_path.exists():
+                    await start_stage(job_id, "extract_audio", "Đang trích xuất Dual Audio 48kHz Stereo & 16kHz Mono...")
+                    on_retry_cb, on_rec_cb = _make_retry_callbacks("extract_audio", "trích xuất âm thanh")
+                    logger.info("[PIPELINE_EXEC] stage=extract_audio service=extract_dual_audio")
+                    audio_info = await execute_with_auto_retry(
+                        extract_dual_audio,
+                        video_path=input_video_path,
+                        audio_dir=job_paths["audio_dir"],
+                        stage_name="extract_audio",
+                        on_retry_callback=on_retry_cb,
+                        on_recovered_callback=on_rec_cb,
+                    )
+                    job_info["audio_info"] = audio_info
+                    await complete_stage(job_id, "extract_audio", "Trích xuất Dual Audio hoàn tất (48kHz Stereo + 16kHz Mono)")
+                else:
+                    await start_stage(job_id, "extract_audio", "Đang nạp file âm thanh 48kHz & 16kHz đã có...")
+                    await complete_stage(job_id, "extract_audio", "Tái sử dụng file âm thanh 48kHz & 16kHz đã có")
             else:
-                await start_stage(job_id, "extract_audio", "Đang nạp file âm thanh 48kHz & 16kHz đã có...")
-                await complete_stage(job_id, "extract_audio", "Tái sử dụng file âm thanh 48kHz & 16kHz đã có")
+                await skip_stage(job_id, "extract_audio", "Bỏ qua trích xuất âm thanh")
         else:
-            await skip_stage(job_id, "extract_audio", "Bỏ qua trích xuất âm thanh")
+            logger.info("[PIPELINE] stage=extract_audio preserved from previous run (ZERO INVOCATION)")
 
         # -------------------------------------------------------------
         # STEP 2: Whisper STT
         # -------------------------------------------------------------
-        current_running_stage = "stt"
-        transcript_path = job_paths["transcript_dir"] / "transcript.json"
-        raw_segments: List[Dict[str, Any]] = []
-        speech_chunks: List[Dict[str, Any]] = []
-        detected_lang = "en"
+        if "stt" in execution_plan:
+            assert_stage_allowed("stt")
+            current_running_stage = "stt"
+            if needs_stt:
+                can_reuse_stt = transcript_path.exists() and not request.run_stt
+                if not can_reuse_stt:
+                    await start_stage(job_id, "stt", f"Đang nhận dạng giọng nói với Faster-Whisper ({request.whisper_model})...")
 
-        if needs_stt:
-            can_reuse_stt = transcript_path.exists() and not request.run_stt
-            if not can_reuse_stt:
-                await start_stage(job_id, "stt", f"Đang nhận dạng giọng nói với Faster-Whisper ({request.whisper_model})...")
+                    async def _on_stt_progress(pct: float, msg: str):
+                        await update_stage_progress(job_id, "stt", progress=pct, message=msg)
 
-                async def _on_stt_progress(pct: float, msg: str):
-                    await update_stage_progress(job_id, "stt", progress=pct, message=msg)
+                    on_retry_cb, on_rec_cb = _make_retry_callbacks("stt", "nhận dạng giọng nói")
+                    logger.info("[PIPELINE_EXEC] stage=stt service=transcribe_audio")
+                    stt_result = await execute_with_auto_retry(
+                        transcribe_audio,
+                        audio_path=whisper_audio_path,
+                        output_transcript_path=transcript_path,
+                        model_size=request.whisper_model,
+                        language=None if request.source_language == "auto" else request.source_language,
+                        progress_callback=_on_stt_progress,
+                        stage_name="stt",
+                        on_retry_callback=on_retry_cb,
+                        on_recovered_callback=on_rec_cb,
+                    )
+                    raw_segments = stt_result.get("segments", [])
+                    speech_chunks = stt_result.get("speech_chunks", [])
+                    detected_lang = stt_result.get("detected_language", "en")
 
-                stt_result = await transcribe_audio(
-                    audio_path=whisper_audio_path,
-                    output_transcript_path=transcript_path,
-                    model_size=request.whisper_model,
-                    language=None if request.source_language == "auto" else request.source_language,
-                    progress_callback=_on_stt_progress,
-                )
-                raw_segments = stt_result.get("segments", [])
-                speech_chunks = stt_result.get("speech_chunks", [])
-                detected_lang = stt_result.get("detected_language", "en")
-
-                job_info["transcript"] = {
-                    "total_segments": len(raw_segments),
-                    "total_speech_chunks": len(speech_chunks),
-                    "language": detected_lang,
-                }
-                await complete_stage(job_id, "stt", f"Hoàn thành nhận dạng: {len(raw_segments)} đoạn thoại ({len(speech_chunks)} SpeechChunks)")
+                    job_info["transcript"] = {
+                        "total_segments": len(raw_segments),
+                        "total_speech_chunks": len(speech_chunks),
+                        "language": detected_lang,
+                    }
+                    await complete_stage(job_id, "stt", f"Hoàn thành nhận dạng: {len(raw_segments)} đoạn thoại ({len(speech_chunks)} SpeechChunks)")
+                else:
+                    await start_stage(job_id, "stt", "Đang nạp transcript.json đã lưu...")
+                    async with aiofiles.open(transcript_path, "r", encoding="utf-8") as f:
+                        cached_stt = json.loads(await f.read())
+                        raw_segments = cached_stt.get("segments", [])
+                        speech_chunks = cached_stt.get("speech_chunks", [])
+                        if not speech_chunks and raw_segments:
+                            speech_chunks = build_speech_chunks_from_stt(raw_segments)
+                        detected_lang = cached_stt.get("detected_language", "en")
+                    await complete_stage(job_id, "stt", f"Tái sử dụng transcript {len(speech_chunks)} SpeechChunks đã có")
             else:
-                await start_stage(job_id, "stt", "Đang nạp transcript.json đã lưu...")
+                await skip_stage(job_id, "stt", "Bỏ qua nhận dạng giọng nói")
+        else:
+            logger.info("[PIPELINE] stage=stt preserved from previous run (ZERO INVOCATION)")
+            if transcript_path.exists():
                 async with aiofiles.open(transcript_path, "r", encoding="utf-8") as f:
                     cached_stt = json.loads(await f.read())
                     raw_segments = cached_stt.get("segments", [])
@@ -1377,193 +1630,319 @@ async def execute_pipeline_core(job_id: str, request: PipelineProcessRequest) ->
                     if not speech_chunks and raw_segments:
                         speech_chunks = build_speech_chunks_from_stt(raw_segments)
                     detected_lang = cached_stt.get("detected_language", "en")
-                await complete_stage(job_id, "stt", f"Tái sử dụng transcript {len(speech_chunks)} SpeechChunks đã có")
-        else:
-            await skip_stage(job_id, "stt", "Bỏ qua nhận dạng giọng nói")
 
         # -------------------------------------------------------------
         # STEP 3: Gemini Translation
         # -------------------------------------------------------------
-        current_running_stage = "translation"
-        translated_chunks: List[Dict[str, Any]] = []
-        translated_path = job_paths["transcript_dir"] / "translated_transcript.json"
+        if "translation" in execution_plan:
+            assert_stage_allowed("translation")
+            current_running_stage = "translation"
+            if needs_translation:
+                cached_trans = None
+                if translated_path.exists():
+                    try:
+                        async with aiofiles.open(translated_path, "r", encoding="utf-8") as f:
+                            cached_trans = json.loads(await f.read())
+                    except Exception:
+                        cached_trans = None
 
-        if needs_translation:
-            cached_trans = None
-            if translated_path.exists():
-                try:
+                can_reuse_translation = (
+                    cached_trans is not None
+                    and not request.run_translation
+                    and cached_trans.get("target_language") == request.target_language
+                    and (
+                        not request.translation_style
+                        or cached_trans.get("translation_style") == request.translation_style
+                        or not cached_trans.get("translation_style")
+                    )
+                )
+
+                if not can_reuse_translation:
+                    await start_stage(job_id, "translation", f"Đang dịch thuật ngữ cảnh ({request.translation_style or 'standard_dubbing'})...")
+
+                    async def _on_trans_progress(completed_count: int, total_count: int, message: Optional[str] = None):
+                        pct = round((completed_count / max(1, total_count)) * 100.0, 1)
+                        msg = message or f"Đang dịch {completed_count}/{total_count} câu ({pct}%)"
+                        await update_stage_progress(
+                            job_id,
+                            "translation",
+                            progress=pct,
+                            message=msg,
+                            extra={"translated_chunks": completed_count, "total_chunks": total_count},
+                        )
+
+                    logger.info("[PIPELINE_EXEC] stage=translation service=translate_transcript_segments")
+                    trans_result = await translate_transcript_segments(
+                        transcript_file=transcript_path,
+                        output_translated_file=translated_path,
+                        source_language=detected_lang,
+                        target_language=request.target_language,
+                        api_key=request.api_key,
+                        translation_style=request.translation_style or "movie_review_spoken_vi",
+                        progress_callback=_on_trans_progress,
+                    )
+                    translated_chunks = trans_result.get("speech_chunks") or trans_result.get("segments", [])
+
+                    job_info["translation"] = {
+                        "source_language": detected_lang,
+                        "target_language": request.target_language,
+                        "translation_style": request.translation_style,
+                        "translated_chunks": len(translated_chunks),
+                    }
+                    await complete_stage(job_id, "translation", f"Dịch hoàn tất {len(translated_chunks)} SpeechChunks sang {request.target_language}")
+                    # Tự động bảo đảm canonical SRT artifact ngay sau khi dịch xong (0 API call)
+                    try:
+                        await ensure_translated_srt_artifact(job_id, job_paths)
+                    except Exception as e:
+                        logger.warning(f"Không thể pre-generate SRT sau translation: {e}")
+                else:
+                    await start_stage(job_id, "translation", "Đang nạp bản dịch đã lưu...")
                     async with aiofiles.open(translated_path, "r", encoding="utf-8") as f:
                         cached_trans = json.loads(await f.read())
-                except Exception:
-                    cached_trans = None
-
-            can_reuse_translation = (
-                cached_trans is not None
-                and not request.run_translation
-                and cached_trans.get("target_language") == request.target_language
-                and (
-                    not request.translation_style
-                    or cached_trans.get("translation_style") == request.translation_style
-                    or not cached_trans.get("translation_style")
-                )
-            )
-
-            if not can_reuse_translation:
-                await start_stage(job_id, "translation", f"Đang dịch thuật ngữ cảnh ({request.translation_style or 'standard_dubbing'})...")
-                trans_result = await translate_transcript_segments(
-                    transcript_file=transcript_path,
-                    output_translated_file=translated_path,
-                    source_language=detected_lang,
-                    target_language=request.target_language,
-                    api_key=request.api_key,
-                    translation_style=request.translation_style or "movie_review_spoken_vi",
-                )
-                translated_chunks = trans_result.get("speech_chunks") or trans_result.get("segments", [])
-
-                job_info["translation"] = {
-                    "source_language": detected_lang,
-                    "target_language": request.target_language,
-                    "translation_style": request.translation_style,
-                    "translated_chunks": len(translated_chunks),
-                }
-                await complete_stage(job_id, "translation", f"Dịch hoàn tất {len(translated_chunks)} SpeechChunks sang {request.target_language}")
+                        translated_chunks = cached_trans.get("speech_chunks", [])
+                    await complete_stage(job_id, "translation", f"Tái sử dụng bản dịch {len(translated_chunks)} SpeechChunks đã có")
+                    try:
+                        await ensure_translated_srt_artifact(job_id, job_paths)
+                    except Exception as e:
+                        logger.warning(f"Không thể pre-generate SRT sau translation reuse: {e}")
             else:
-                await start_stage(job_id, "translation", "Đang nạp bản dịch đã lưu...")
+                await skip_stage(job_id, "translation", "Bỏ qua dịch thuật")
+        else:
+            logger.info("[PIPELINE] stage=translation preserved from previous run (ZERO INVOCATION)")
+            if translated_path.exists():
                 async with aiofiles.open(translated_path, "r", encoding="utf-8") as f:
                     cached_trans = json.loads(await f.read())
-                    translated_chunks = cached_trans.get("speech_chunks", [])
-                await complete_stage(job_id, "translation", f"Tái sử dụng bản dịch {len(translated_chunks)} SpeechChunks đã có")
+                    translated_chunks = cached_trans.get("speech_chunks") or cached_trans.get("segments", [])
+                try:
+                    await ensure_translated_srt_artifact(job_id, job_paths)
+                except Exception as e:
+                    logger.warning(f"Không thể pre-generate SRT trong translation preserved: {e}")
+
+        # -------------------------------------------------------------
+        # STEP 4: AI Voice TTS (Edge-TTS Speech Generation with Continuity Analyzer)
+        # -------------------------------------------------------------
+        resolved_speed = resolve_effective_tts_speed(
+            voice_id=request.voice_id,
+            user_speed_rate=request.speed_rate or "+0%",
+        )
+        pause_profile = resolved_speed.get("pause_profile", "standard")
+        effective_speed_str = resolved_speed.get("rate", request.speed_rate or "+0%")
+
+        tts_input_chunks = translated_chunks if translated_chunks else speech_chunks
+
+        # Phân tách Subtitle Segmentation khỏi TTS Speech Segmentation (Speech Continuity Analyzer)
+        tts_phrases, continuity_debug = analyze_speech_continuity(
+            speech_chunks=tts_input_chunks,
+            style=request.translation_style or "movie_review_spoken_vi",
+        )
+
+        # Lưu log debug speech continuity
+        continuity_debug_file = job_paths["transcript_dir"] / "speech_continuity_debug.json"
+        try:
+            continuity_debug_file.parent.mkdir(parents=True, exist_ok=True)
+            async with aiofiles.open(continuity_debug_file, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(continuity_debug, indent=2, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"Lỗi ghi speech_continuity_debug.json: {e}")
+
+        if "tts" in execution_plan:
+            assert_stage_allowed("tts")
+            current_running_stage = "tts"
+            if needs_tts:
+                existing_tts_count = 0
+                for phrase in tts_phrases:
+                    idx = phrase["index"]
+                    seg_f = job_paths["tts_dir"] / f"segment_{idx:04d}.mp3"
+                    if seg_f.exists() and seg_f.stat().st_size > 0:
+                        existing_tts_count += 1
+
+                total_tts_count = len(tts_phrases)
+                initial_tts_pct = round((existing_tts_count / max(1, total_tts_count)) * 100.0, 1) if total_tts_count > 0 else 0.0
+                initial_tts_msg = (
+                    f"Đang tiếp tục tổng hợp {existing_tts_count}/{total_tts_count} TTS Phrases (Tái sử dụng {existing_tts_count} đoạn, {initial_tts_pct}%)"
+                    if existing_tts_count > 0
+                    else f"Đang tổng hợp giọng đọc AI ({request.voice_id})..."
+                )
+
+                await start_stage(job_id, "tts", initial_tts_msg, initial_progress=initial_tts_pct)
+
+                async def _on_tts_progress(completed_count: int, total_count: int, message: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
+                    pct = round((completed_count / max(1, total_count)) * 100.0, 1)
+                    msg = message or f"Đang tổng hợp {completed_count}/{total_count} TTS Phrases ({pct}%)"
+                    extra_data = {
+                        "completed_chunks": completed_count,
+                        "total_chunks": total_count,
+                        "last_progress_at": _iso_now(),
+                    }
+                    if extra:
+                        extra_data.update(extra)
+                    await update_stage_progress(
+                        job_id,
+                        "tts",
+                        progress=pct,
+                        message=msg,
+                        extra=extra_data,
+                    )
+
+                logger.info(f"[PIPELINE_EXEC] stage=tts service=generate_all_segments ({len(tts_phrases)} phrases)")
+                tts_segments = await generate_all_segments(
+                    segments=tts_phrases,
+                    voice=request.voice_id,
+                    tts_dir=job_paths["tts_dir"],
+                    speed_rate=effective_speed_str,
+                    progress_callback=_on_tts_progress,
+                )
+                await complete_stage(job_id, "tts", f"Tổng hợp thành công {len(tts_segments)} TTS Phrases liền mạch")
+            else:
+                await skip_stage(job_id, "tts", "Bỏ qua tổng hợp giọng đọc")
         else:
-            await skip_stage(job_id, "translation", "Bỏ qua dịch thuật")
+            logger.info("[PIPELINE] stage=tts preserved from previous run (ZERO INVOCATION)")
+            try:
+                tts_segments = reconstruct_tts_segments_from_disk(
+                    tts_dir=job_paths["tts_dir"],
+                    speech_chunks=tts_phrases,
+                )
+            except Exception as e:
+                logger.warning(f"[PIPELINE] Could not pre-reconstruct tts_segments in tts preserved branch: {e}")
 
         # -------------------------------------------------------------
-        # STEP 4: Subtitles (.SRT & .ASS generation)
+        # STEP 5: Audio Sync (Timeline Alignment & Natural Pauses)
         # -------------------------------------------------------------
-        current_running_stage = "subtitle"
-        srt_file = job_paths["subtitles_dir"] / "translated.srt"
-        ass_file = job_paths["subtitles_dir"] / "translated.ass"
-        subtitle_summary: Dict[str, Any] = {}
-        if needs_subtitle:
-            await start_stage(job_id, "subtitle", "Đang phân đoạn và validate phụ đề SRT & ASS...")
-            chunks_for_subs = translated_chunks if translated_chunks else speech_chunks
-            _, valid_subs, subtitle_summary = await save_srt_file(chunks_for_subs, srt_file)
-            
-            sub_style_dict = request.subtitle_style.dict() if request.subtitle_style else {}
-            await save_ass_file(valid_subs, ass_file, sub_style_dict)
-
-            job_info["subtitles_summary"] = subtitle_summary
-            await complete_stage(job_id, "subtitle", f"Tạo file SRT & ASS thành công ({len(valid_subs)} phụ đề, Avg CPS: {subtitle_summary.get('average_cps', 0)})")
-        else:
-            await skip_stage(job_id, "subtitle", "Không tạo phụ đề")
-
-        # -------------------------------------------------------------
-        # STEP 5: TTS & Audio Sync (Edge-TTS + Pause Profile)
-        # -------------------------------------------------------------
-        current_running_stage = "tts"
-        dubbed_voice_wav = job_paths["output_dir"] / "dubbed_voice.wav"
-        sync_result: Dict[str, Any] = {}
-
-        if needs_tts:
-            resolved_speed = resolve_effective_tts_speed(
-                voice_id=request.voice_id,
-                user_speed_rate=request.speed_rate or "+0%",
-            )
-            pause_profile = resolved_speed.get("pause_profile", "standard")
-            effective_speed_str = resolved_speed.get("rate", request.speed_rate or "+0%")
-
-            tts_input_chunks = translated_chunks if translated_chunks else speech_chunks
-            existing_tts_count = 0
-            for seg in tts_input_chunks:
-                idx = seg["index"]
-                seg_f = job_paths["tts_dir"] / f"segment_{idx:04d}.mp3"
-                if seg_f.exists() and seg_f.stat().st_size > 0:
-                    existing_tts_count += 1
-
-            total_tts_count = len(tts_input_chunks)
-            initial_tts_pct = round((existing_tts_count / max(1, total_tts_count)) * 100.0, 1) if total_tts_count > 0 else 0.0
-            initial_tts_msg = (
-                f"Đang tiếp tục tổng hợp {existing_tts_count}/{total_tts_count} SpeechChunks (Tái sử dụng {existing_tts_count} đoạn)"
-                if existing_tts_count > 0
-                else f"Đang tổng hợp giọng đọc AI ({request.voice_id})..."
-            )
-
-            await start_stage(job_id, "tts", initial_tts_msg)
-            if existing_tts_count > 0:
-                await update_stage_progress(job_id, "tts", progress=initial_tts_pct, message=initial_tts_msg)
-
-            async def _on_tts_progress(completed_count: int, total_count: int):
-                pct = round((completed_count / max(1, total_count)) * 100.0, 1)
-                msg = f"Đang tổng hợp {completed_count}/{total_count} SpeechChunks ({pct}%)"
-                await update_stage_progress(job_id, "tts", progress=pct, message=msg)
-
-            tts_segments = await generate_all_segments(
-                segments=tts_input_chunks,
-                voice=request.voice_id,
-                tts_dir=job_paths["tts_dir"],
-                speed_rate=effective_speed_str,
-                progress_callback=_on_tts_progress,
-            )
-            await complete_stage(job_id, "tts", f"Tổng hợp thành công {len(tts_segments)} đoạn giọng đọc AI")
-
+        if "audio_sync" in execution_plan:
+            assert_stage_allowed("audio_sync")
             current_running_stage = "audio_sync"
-            await start_stage(job_id, "audio_sync", f"Đang đồng bộ timeline và ghép track âm thanh 48kHz ({pause_profile})...")
+            if needs_tts:
+                await start_stage(job_id, "audio_sync", f"Đang đồng bộ timeline và ghép track âm thanh 48kHz ({pause_profile})...")
 
-            total_duration = float(job_info.get("video_info", {}).get("duration", 0.0))
-            if total_duration <= 0:
-                v_probe = await probe_media_file(input_video_path)
-                total_duration = float(v_probe.get("duration", 0.0))
+                total_duration = float(job_info.get("video_info", {}).get("duration", 0.0))
+                if total_duration <= 0:
+                    v_probe = await probe_media_file(input_video_path)
+                    total_duration = float(v_probe.get("duration", 0.0))
 
-            temp_sync_dir = job_paths["tts_dir"] / "sync_temp"
-            _, sync_result = await sync_and_combine_voice_track(
-                tts_segments=tts_segments,
-                output_dubbed_wav=dubbed_voice_wav,
-                total_video_duration=total_duration,
-                temp_sync_dir=temp_sync_dir,
-                pause_profile=pause_profile,
-            )
-            job_info["tts_result"] = sync_result
-            await complete_stage(job_id, "audio_sync", f"Đồng bộ hoàn tất (Timeline Drift: {sync_result.get('timeline_drift_ms', 0):.1f}ms)")
+                temp_sync_dir = job_paths["tts_dir"] / "sync_temp"
+                on_retry_cb, on_rec_cb = _make_retry_callbacks("audio_sync", "đồng bộ âm thanh")
+
+                # Tái tạo tts_segments từ artifacts trên đĩa nếu tts đã được preserve (TEST F)
+                if "tts_segments" not in locals() or not tts_segments:
+                    logger.info("[PIPELINE] stage=audio_sync reconstructing tts_segments from disk artifacts...")
+                    tts_segments = reconstruct_tts_segments_from_disk(
+                        tts_dir=job_paths["tts_dir"],
+                        speech_chunks=tts_input_chunks,
+                    )
+
+                # Validate input segments trước khi chạy (TEST B, E, G)
+                validate_audio_sync_segments(tts_segments, verify_files_exist=True)
+
+                async def _run_audio_sync_step():
+                    return await sync_and_combine_voice_track(
+                        tts_segments=tts_segments,
+                        output_dubbed_wav=dubbed_voice_wav,
+                        total_video_duration=total_duration,
+                        temp_sync_dir=temp_sync_dir,
+                        pause_profile=pause_profile,
+                    )
+
+                logger.info("[PIPELINE_EXEC] stage=audio_sync service=sync_and_combine_voice_track")
+                raw_sync_res = await execute_with_auto_retry(
+                    _run_audio_sync_step,
+                    stage_name="audio_sync",
+                    on_retry_callback=on_retry_cb,
+                    on_recovered_callback=on_rec_cb,
+                )
+                dubbed_voice_wav, sync_stats = normalize_audio_sync_result(raw_sync_res)
+                job_info["tts_result"] = sync_stats
+                await complete_stage(job_id, "audio_sync", f"Đồng bộ hoàn tất (Timeline Drift: {sync_stats.get('timeline_drift_ms', 0.0):.1f}ms)")
+            else:
+                await skip_stage(job_id, "audio_sync", "Bỏ qua đồng bộ âm thanh")
         else:
-            await skip_stage(job_id, "tts", "Bỏ qua tổng hợp giọng đọc")
-            await skip_stage(job_id, "audio_sync", "Bỏ qua đồng bộ âm thanh")
+            logger.info("[PIPELINE] stage=audio_sync preserved from previous run (ZERO INVOCATION)")
+            sync_stats = job_info.get("tts_result", {})
 
         # -------------------------------------------------------------
-        # STEP 6: Render Final Video (H.264 + AAC 48kHz Stereo)
+        # STEP 6: Subtitles (.SRT & .ASS generation)
         # -------------------------------------------------------------
-        current_running_stage = "render"
-        render_result: Dict[str, Any] = {}
-        pipeline_metrics: Dict[str, Any] = {}
-        output_final_mp4 = job_paths["output_dir"] / f"final_dubbed.{request.output_format}"
+        if "subtitle" in execution_plan:
+            assert_stage_allowed("subtitle")
+            current_running_stage = "subtitle"
+            if needs_subtitle:
+                await start_stage(job_id, "subtitle", "Đang phân đoạn và validate phụ đề SRT & ASS...")
+                chunks_for_subs = translated_chunks if translated_chunks else speech_chunks
 
-        if needs_render:
-            await start_stage(job_id, "render", f"Đang render video hoàn chỉnh ({request.output_resolution}, {request.output_format})...")
-            render_result = await render_final_video(
-                input_video_path=input_video_path,
-                original_audio_path=original_audio_path,
-                dubbed_audio_path=dubbed_voice_wav,
-                output_video_path=output_final_mp4,
-                srt_subtitle_path=srt_file if (should_burn_subs and srt_file.exists()) else None,
-                ass_subtitle_path=ass_file if (should_burn_subs and ass_file.exists()) else None,
-                subtitle_style=request.subtitle_style.dict() if request.subtitle_style else None,
-                keep_background_audio=request.keep_background_audio,
-                background_volume=request.background_volume,
-                voice_volume=request.voice_volume,
-                burn_subtitles=should_burn_subs,
-            )
+                async def _generate_subtitles_step():
+                    nonlocal valid_subs, subtitle_summary
+                    _, valid_subs, subtitle_summary = await save_srt_file(chunks_for_subs, srt_file)
+                    sub_style_dict = request.subtitle_style.dict() if request.subtitle_style else {}
+                    await save_ass_file(valid_subs, ass_file, sub_style_dict)
+                    return valid_subs, subtitle_summary
 
-            pipeline_metrics = compute_pipeline_metrics(
-                speech_chunks=translated_chunks if translated_chunks else speech_chunks,
-                subtitles=valid_subs if 'valid_subs' in locals() else [],
-                sync_stats=sync_result,
-                original_whisper_count=len(raw_segments),
-                expected_total_duration=total_duration if 'total_duration' in locals() else 0.0,
-                synthesis_rate_percent=resolved_speed.get("synthesis_rate_percent", 0.0) if 'resolved_speed' in locals() else 0.0,
-            )
-            job_info["pipeline_metrics"] = pipeline_metrics
-            job_info["render_result"] = render_result
-            await complete_stage(job_id, "render", f"Render hoàn tất ({render_result.get('resolution')}, {format_file_size(render_result.get('size_bytes', 0))})")
+                on_retry_cb, on_rec_cb = _make_retry_callbacks("subtitle", "tạo phụ đề")
+                logger.info("[PIPELINE_EXEC] stage=subtitle service=save_srt_file & save_ass_file")
+                await execute_with_auto_retry(
+                    _generate_subtitles_step,
+                    stage_name="subtitle",
+                    on_retry_callback=on_retry_cb,
+                    on_recovered_callback=on_rec_cb,
+                )
+
+                job_info["subtitles_summary"] = subtitle_summary
+                await complete_stage(job_id, "subtitle", f"Tạo file SRT & ASS thành công ({len(valid_subs)} phụ đề, Avg CPS: {subtitle_summary.get('average_cps', 0)})")
+            else:
+                await skip_stage(job_id, "subtitle", "Không tạo phụ đề")
         else:
-            await skip_stage(job_id, "render", "Bỏ qua render video")
+            logger.info("[PIPELINE] stage=subtitle preserved from previous run (ZERO INVOCATION)")
+
+        # -------------------------------------------------------------
+        # STEP 7: Render Final Video
+        # -------------------------------------------------------------
+        if "render" in execution_plan:
+            assert_stage_allowed("render")
+            current_running_stage = "render"
+            if needs_render:
+                await start_stage(job_id, "render", f"Đang render video hoàn chỉnh ({request.output_resolution}, {request.output_format})...")
+
+                on_retry_cb, on_rec_cb = _make_retry_callbacks("render", "render video")
+
+                async def _run_render_step():
+                    return await render_final_video(
+                        input_video_path=input_video_path,
+                        original_audio_path=original_audio_path,
+                        dubbed_audio_path=dubbed_voice_wav,
+                        output_video_path=output_final_mp4,
+                        srt_subtitle_path=srt_file if (should_burn_subs and srt_file.exists()) else None,
+                        ass_subtitle_path=ass_file if (should_burn_subs and ass_file.exists()) else None,
+                        subtitle_style=request.subtitle_style.dict() if request.subtitle_style else None,
+                        mask_regions=[m.dict() for m in request.mask_regions] if request.mask_regions else None,
+                        keep_background_audio=request.keep_background_audio,
+                        background_volume=request.background_volume,
+                        voice_volume=request.voice_volume,
+                        burn_subtitles=should_burn_subs,
+                    )
+
+                logger.info("[PIPELINE_EXEC] stage=render service=render_final_video")
+                render_result = await execute_with_auto_retry(
+                    _run_render_step,
+                    stage_name="render",
+                    on_retry_callback=on_retry_cb,
+                    on_recovered_callback=on_rec_cb,
+                )
+
+                total_duration = float(job_info.get("video_info", {}).get("duration", 0.0))
+                active_sync_stats = sync_stats if ('sync_stats' in locals() and isinstance(sync_stats, dict)) else (job_info.get("tts_result") if isinstance(job_info.get("tts_result"), dict) else {})
+                pipeline_metrics = compute_pipeline_metrics(
+                    speech_chunks=translated_chunks if translated_chunks else speech_chunks,
+                    subtitles=valid_subs if 'valid_subs' in locals() and valid_subs else [],
+                    sync_stats=active_sync_stats,
+                    original_whisper_count=len(raw_segments),
+                    expected_total_duration=total_duration,
+                    synthesis_rate_percent=resolved_speed.get("synthesis_rate_percent", 0.0),
+                )
+                job_info["pipeline_metrics"] = pipeline_metrics
+                job_info["render_result"] = render_result
+                await complete_stage(job_id, "render", f"Render hoàn tất ({render_result.get('resolution')}, {format_file_size(render_result.get('size_bytes', 0))})")
+            else:
+                await skip_stage(job_id, "render", "Bỏ qua render video")
+        else:
+            logger.info("[PIPELINE] stage=render preserved from previous run (ZERO INVOCATION)")
 
         # Hoàn tất toàn bộ Pipeline thành công
         job_info = await load_job_info(job_id) or job_info
@@ -1571,15 +1950,22 @@ async def execute_pipeline_core(job_id: str, request: PipelineProcessRequest) ->
         job_info["progress"] = 100.0
         job_info["current_stage"] = None
 
-        final_video_url = f"/api/jobs/{job_id}/result/video" if (needs_render and output_final_mp4.exists()) else None
-        download_video_url = f"/api/jobs/{job_id}/download/video" if (needs_render and output_final_mp4.exists()) else None
-        download_srt_url = f"/api/jobs/{job_id}/download/subtitle" if srt_file.exists() else None
+        current_rev = job_info.get("output_revision", 0)
+        new_output_rev = current_rev + 1 if needs_render else current_rev
+        job_info["output_revision"] = new_output_rev
+
+        final_video_url = f"/api/jobs/{job_id}/result/video?v={new_output_rev}" if (needs_render and output_final_mp4.exists()) else None
+        download_video_url = f"/api/jobs/{job_id}/download/video?v={new_output_rev}" if (needs_render and output_final_mp4.exists()) else None
+        download_srt_url = f"/api/jobs/{job_id}/download/subtitle?v={new_output_rev}" if srt_file.exists() else None
 
         active_segments = translated_chunks if translated_chunks else (speech_chunks if speech_chunks else raw_segments)
         job_info["segments"] = active_segments
 
         final_video_meta = {
             "available": bool(needs_render and output_final_mp4.exists() and output_final_mp4.stat().st_size > 0),
+            "current": True,
+            "reprocessing": False,
+            "revision": new_output_rev,
             "filename": output_final_mp4.name if needs_render else None,
             "duration": render_result.get("duration"),
             "duration_formatted": render_result.get("duration_formatted"),
@@ -1592,6 +1978,15 @@ async def execute_pipeline_core(job_id: str, request: PipelineProcessRequest) ->
             "video_codec": "h264",
             "audio_codec": "aac",
             "audio_sample_rate": 48000,
+            "updated_at": _iso_now(),
+            "config_signature": {
+                "voice_id": request.voice_id,
+                "speed_rate": request.speed_rate,
+                "pitch": request.pitch,
+                "translation_style": request.translation_style,
+                "target_language": request.target_language,
+                "output_resolution": request.output_resolution,
+            },
         }
 
         job_info["video"] = final_video_meta
@@ -1632,8 +2027,26 @@ async def execute_pipeline_core(job_id: str, request: PipelineProcessRequest) ->
         await fail_stage(job_id, current_running_stage, "HTTP_EXCEPTION", err_msg)
         return {"success": False, "job_id": job_id, "status": "failed", "error": err_msg}
 
+    except AudioSyncError as ase:
+        logger.error(f"Lỗi Audio Sync cho job {job_id}: {ase}", exc_info=True)
+        await fail_stage(job_id, current_running_stage, ase.code, ase.message)
+        return {"success": False, "job_id": job_id, "status": "failed", "error": ase.message, "error_code": ase.code}
+
     except Exception as e:
-        logger.error(f"Lỗi khi thực thi Pipeline cho job {job_id}: {e}", exc_info=True)
-        await fail_stage(job_id, current_running_stage, "PIPELINE_ERROR", str(e))
-        return {"success": False, "job_id": job_id, "status": "failed", "error": str(e)}
+        logger.error(f"Lỗi khi thực thi Pipeline cho job {job_id} tại stage {current_running_stage}: {e}", exc_info=True)
+        err_str = str(e)
+        if is_fatal_api_key_error(e):
+            err_str = "Khóa Gemini API không hợp lệ hoặc đã hết hạn (API_KEY_INVALID). Vui lòng bấm 'Thay đổi' tại mục Cấu hình dịch thuật để nhập API Key mới và thử lại."
+            err_code = "API_KEY_INVALID"
+        elif isinstance(e, AttributeError):
+            err_str = f"Lỗi cấu trúc dữ liệu nội bộ ({current_running_stage}): {e}"
+            err_code = "INTERNAL_DATA_STRUCTURE_ERROR"
+        else:
+            err_code = "PIPELINE_ERROR"
+
+        await fail_stage(job_id, current_running_stage, err_code, err_str)
+        return {"success": False, "job_id": job_id, "status": "failed", "error": err_str}
+
+    finally:
+        unregister_active_task(job_id)
 

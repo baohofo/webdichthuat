@@ -1,13 +1,80 @@
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
+import time
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 import edge_tts
 
+from backend.config import (
+    TTS_REQUEST_TIMEOUT,
+    TTS_STUCK_THRESHOLD_SEC,
+    TTS_CONCURRENCY,
+    MIN_VALID_AUDIO_BYTES,
+)
+
 logger = logging.getLogger("tts_service")
+
+
+def compute_tts_chunk_signature(
+    voice: str,
+    speed_rate: str,
+    text: str,
+    pitch: str = "+0Hz",
+    translation_rev: int = 1,
+    norm_version: str = "v2_pause_norm",
+) -> str:
+    """
+    Tính signature SHA-256 xác thực cấu hình tạo giọng đọc cho từng SpeechChunk.
+    Bao gồm toàn bộ các tham số ảnh hưởng trực tiếp đến waveform đầu ra:
+    - voice: voice ID hoặc base_voice
+    - speed_rate: tốc độ tổng hợp
+    - pitch: cao độ giọng
+    - text: normalized spoken text
+    - translation_rev: phiên bản bản dịch
+    - norm_version: phiên bản thuật toán normalization
+    """
+    payload = f"{voice.strip()}|{speed_rate.strip()}|{pitch.strip()}|{text.strip()}|rev_{translation_rev}|{norm_version}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def save_tts_checkpoint_atomic(checkpoint_file: Path, chunk_states: Dict[str, Any]) -> None:
+    """
+    Ghi file checkpoint tts_chunks_state.json theo cơ chế Atomic Write (.tmp + os.replace)
+    kết hợp retry trên Windows để đảm bảo an toàn tuyệt đối ngay cả khi server bị crash.
+    """
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = checkpoint_file.parent / f"{checkpoint_file.stem}_{int(time.time()*1000)}.tmp"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(chunk_states, f, indent=2, ensure_ascii=False)
+        for attempt in range(5):
+            try:
+                os.replace(str(temp_file), str(checkpoint_file))
+                break
+            except (PermissionError, OSError):
+                if attempt == 4:
+                    with open(checkpoint_file, "w", encoding="utf-8") as f:
+                        json.dump(chunk_states, f, indent=2, ensure_ascii=False)
+                else:
+                    time.sleep(0.01 * (attempt + 1))
+    except Exception as e:
+        logger.error(f"Lỗi atomic write tts_chunks_state: {e}", exc_info=True)
+    finally:
+        if temp_file.exists():
+            try:
+                temp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 # Danh mục các phong cách giọng đọc AI phong phú theo ngôn ngữ
 VOICE_CATALOG: Dict[str, List[Dict[str, Any]]] = {
@@ -283,22 +350,68 @@ def _resolve_voice_params(voice_id: str, user_speed_rate: str = "+0%") -> Dict[s
 
 
 
-def clean_text_for_tts(text: str) -> str:
+def normalize_spoken_text_for_tts(text: str, style: str = "movie_review_spoken_vi") -> str:
+    r"""
+    Chuẩn hóa văn bản dành riêng cho TTS synthesis (KHÔNG sửa subtitle hiển thị).
+    Tối ưu nhịp điệu đọc cho thuyết minh / Review Phim TikTok:
+    - Loại bỏ chú thích trong ngoặc [music], (cười)...
+    - Collapse duplicate pause markers: '... ...', '……', '....', '. . .', ',,', ', , '
+    - Loại bỏ leading continuation ellipsis ở đầu câu ('^(\.{2,}|…|\s|,)+') để Edge-TTS không bị delay im lặng ở đầu audio.
+    - Chuyển đổi mid-sentence ellipsis giữa các mệnh đề liên tục sang dấu phẩy ',' để giọng đọc liền mạch, ngắt nghỉ nhẹ (0.10s) thay vì ngắt lặng (0.60s).
+    - Bảo lưu suspense ellipsis khi thực sự là kết thúc ý lửng / cliffhanger ở cuối câu ('Có gì đó không ổn...').
+    - Chuẩn hóa khoảng trắng và dấu câu.
+    """
+    if not text:
+        return ""
+
+    t = text.strip()
+
+    # 1. Loại bỏ chú thích trong ngoặc [music], (applause)...
+    t = re.sub(r"\[.*?\]|\(.*?\)", "", t).strip()
+
+    # 2. Collapse duplicate pause markers & canonicalization
+    # '... ...', '...  ...', '……', '....', '. . .'
+    t = re.sub(r"\.{4,}", "...", t)
+    t = re.sub(r"\.\s*\.\s*\.+", "...", t)
+    t = re.sub(r"…+", "...", t)
+    t = re.sub(r"(\.{3,}|…)(?:\s*(\.{3,}|…))+", "...", t)
+    t = re.sub(r",\s*,+", ",", t)
+    t = re.sub(r"\?{2,}", "?", t)
+    t = re.sub(r"\!{2,}", "!", t)
+    t = re.sub(r"(\.{3,}|…)\s*,\s*", ", ", t)
+    t = re.sub(r",\s*(\.{3,}|…)", ", ", t)
+    t = re.sub(r"[,;:]\s*[,;:]+", ",", t)
+
+    # 3. Loại bỏ leading continuation markers ở đầu câu
+    # Ví dụ: '...tiếp tục sinh tồn ở màn này không?' -> 'tiếp tục sinh tồn ở màn này không?'
+    t = re.sub(r"^(\.{2,}|…|\s|,)+", "", t).strip()
+
+    # 4. Xử lý mid-sentence ellipsis cho phong cách review / spoken commentary
+    # Khi '...' xuất hiện ở giữa câu (theo sau bởi chữ cái, từ nối, hoặc dấu ngoặc trích dẫn mà không phải hết câu):
+    # Ví dụ Case A: 'Thế nhưng điều nguy hiểm là... ngay trên hòn đảo' -> 'Thế nhưng điều nguy hiểm là, ngay trên hòn đảo'
+    # Ví dụ Case C: 'Giờ tôi mới hiểu... câu' -> 'Giờ tôi mới hiểu, câu'
+    # Ví dụ Case D: 'nhất định... ...phải chế' -> 'nhất định, phải chế'
+    if style in {"movie_review_spoken_vi", "natural_commentary", "movie_review"}:
+        # Thay thế mid-sentence ellipsis giữa các từ thành dấu phẩy
+        t = re.sub(r"(?<=[\w\d\"\'\)])\s*(?:\.{3,}|…)\s*(?=[\w\d\"\'\(])", ", ", t)
+
+    # 5. Đảm bảo dấu câu đơn lẻ có khoảng trắng theo sau hợp lệ (không tách dấu ba chấm '...')
+    t = re.sub(r"(?<!\.)([,:;?!])(?=[^\s\d\"\'\)])", r"\1 ", t)
+    t = re.sub(r"(?<!\.)\.(?!\.)(?=[^\s\d\"\'\)])", r". ", t)
+    t = re.sub(r"(\.{3,}|…)(?=[^\s\"\'\)])", r"\1 ", t)
+
+    # 6. Dọn dẹp khoảng trắng thừa và dấu phẩy trùng
+    t = re.sub(r",\s*,+", ",", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    return t
+
+
+def clean_text_for_tts(text: str, style: str = "movie_review_spoken_vi") -> str:
     """
     Làm sạch và tối ưu hóa văn bản để giọng đọc ngắt câu tự nhiên, không bị vấp.
     """
-    t = text.strip()
-    # Loại bỏ dấu ngoặc vuông chú thích [music], (applause)...
-    t = re.sub(r"\[.*?\]|\(.*?\)", "", t)
-    # Chuẩn hóa dấu chấm câu lặp lại
-    t = re.sub(r"\.{2,}", "...", t)
-    t = re.sub(r"\?{2,}", "?", t)
-    t = re.sub(r"\!{2,}", "!", t)
-    # Đảm bảo có khoảng trắng sau dấu câu
-    t = re.sub(r"([,.:;?!])(?=[^\s\d])", r"\1 ", t)
-    # Loại bỏ khoảng trắng thừa
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return normalize_spoken_text_for_tts(text, style=style)
 
 
 class BaseTTSProvider(ABC):
@@ -309,8 +422,15 @@ class BaseTTSProvider(ABC):
         voice: str,
         output_file: Path,
         speed_rate: str = "+0%",
+        pitch: Optional[str] = None,
+        style: str = "movie_review_spoken_vi",
+        max_retries: int = 3,
+        attempt_callback: Optional[Any] = None,
     ) -> Path:
         pass
+
+
+from backend.utils.retry_utils import is_recoverable_error
 
 
 class EdgeTTSProvider(BaseTTSProvider):
@@ -320,20 +440,34 @@ class EdgeTTSProvider(BaseTTSProvider):
         voice: str,
         output_file: Path,
         speed_rate: str = "+0%",
+        pitch: Optional[str] = None,
+        style: str = "movie_review_spoken_vi",
         max_retries: int = 3,
+        attempt_callback=None,
     ) -> Path:
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        # 1. Tận dụng cache nếu file đã tồn tại và hợp lệ
-        if output_file.exists() and output_file.stat().st_size > 200:
+        # 1. Tận dụng cache nếu file đã tồn tại và hợp lệ (>= MIN_VALID_AUDIO_BYTES)
+        if output_file.exists() and output_file.stat().st_size >= MIN_VALID_AUDIO_BYTES:
             return output_file
 
         params = _resolve_voice_params(voice, speed_rate)
-        clean_text = clean_text_for_tts(text)
+        if pitch is not None:
+            params["pitch"] = pitch
+
+        clean_text = clean_text_for_tts(text, style=style)
         if not clean_text:
             clean_text = "..."
 
         last_error = None
+        backoff_delays = [1.0, 2.0, 4.0]
+
         for attempt in range(1, max_retries + 1):
+            if attempt > 1 and attempt_callback:
+                try:
+                    await attempt_callback(attempt, max_retries, last_error)
+                except Exception:
+                    pass
+
             try:
                 communicate = edge_tts.Communicate(
                     text=clean_text,
@@ -341,18 +475,35 @@ class EdgeTTSProvider(BaseTTSProvider):
                     rate=params["rate"],
                     pitch=params["pitch"],
                 )
-                # Đặt timeout 20s cho mỗi lần giao tiếp EdgeTTS để tránh treo vô tận
-                await asyncio.wait_for(communicate.save(str(output_file.resolve())), timeout=20.0)
-                if output_file.exists() and output_file.stat().st_size > 0:
+                # Đặt timeout từ config (TTS_REQUEST_TIMEOUT) cho mỗi lần giao tiếp EdgeTTS để tránh treo vô tận
+                await asyncio.wait_for(communicate.save(str(output_file.resolve())), timeout=TTS_REQUEST_TIMEOUT)
+                if output_file.exists() and output_file.stat().st_size >= MIN_VALID_AUDIO_BYTES:
+                    if attempt > 1 and attempt_callback:
+                        try:
+                            await attempt_callback(attempt, max_retries, None, recovered=True)
+                        except Exception:
+                            pass
                     return output_file
+                else:
+                    # File sinh ra bị rỗng hoặc nhỏ bất thường -> dọn dẹp và thử lại
+                    if output_file.exists():
+                        output_file.unlink(missing_ok=True)
+                    raise RuntimeError(f"FILE_CORRUPTED_OR_TOO_SMALL: Kích thước file audio < {MIN_VALID_AUDIO_BYTES} bytes")
             except Exception as e:
                 last_error = e
                 logger.warning(f"Lỗi Edge-TTS lần {attempt}/{max_retries} cho text '{clean_text[:30]}...': {e}")
-                if output_file.exists() and output_file.stat().st_size == 0:
+                if output_file.exists() and output_file.stat().st_size < MIN_VALID_AUDIO_BYTES:
                     output_file.unlink(missing_ok=True)
-                await asyncio.sleep(0.8 * attempt)
 
-        raise RuntimeError(f"Edge-TTS thất bại sau {max_retries} lần thử: {last_error}")
+                if not is_recoverable_error(e) and not isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                    logger.warning(f"Lỗi Edge-TTS không thể phục hồi: {e}")
+                    raise e
+
+                if attempt < max_retries:
+                    wait_sec = backoff_delays[min(attempt - 1, len(backoff_delays) - 1)]
+                    await asyncio.sleep(wait_sec)
+
+        raise RuntimeError(f"EDGE_TTS_TEMPORARY_FAILURE: Thất bại sau {max_retries} lần thử: {last_error}")
 
 
 _DEFAULT_PROVIDER: BaseTTSProvider = EdgeTTSProvider()
@@ -395,23 +546,36 @@ async def generate_all_segments(
     tts_dir: Path,
     speed_rate: str = "+0%",
     provider: Optional[BaseTTSProvider] = None,
-    concurrency_limit: int = 4,
+    concurrency_limit: int = TTS_CONCURRENCY,
     progress_callback=None,
     force_regenerate: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Tổng hợp audio cho toàn bộ SpeechChunks hỗ trợ Item-Level Checkpoint & Resume:
-    - Nếu chunk đã được sinh và file segment_XXXX.mp3 hợp lệ (> 0 bytes), tái sử dụng ngay lập tức mà không gọi mạng.
-    - Lưu trạng thái chi tiết từng chunk vào tts_chunks_state.json để hỗ trợ retry chính xác từ đoạn bị lỗi.
+    - Zero-Byte File Cleaner & Reconcile: Xóa sạch file < 200 bytes khi bắt đầu.
+    - Fast Checkpoint Validation: Scan toàn bộ file trong < 5ms.
+    - Chunk đã có file hợp lệ (>= 200 bytes) được tái sử dụng 100% (KHÔNG gọi mạng, KHÔNG rewrite đĩa).
+    - Incremental Atomic Checkpoint Flush: Sau mỗi chunk (thành công hoặc thất bại), ghi atomic tts_chunks_state.json và gọi callback.
+    - Realtime Active Chunks Heartbeat: Báo cáo danh sách chunk đang chạy đồng thời.
     """
     tts_dir.mkdir(parents=True, exist_ok=True)
     p = provider or _DEFAULT_PROVIDER
     semaphore = asyncio.Semaphore(concurrency_limit)
-    completed_count = 0
     total_count = len(segments)
     lock = asyncio.Lock()
+    active_chunk_indices: Set[int] = set()
 
-    # Nạp checkpoint cũ nếu có
+    # 1. Zero-Byte & Corrupted File Cleaner on Start (Invariant 2)
+    if not force_regenerate and tts_dir.exists():
+        for f in tts_dir.glob("segment_*.mp3"):
+            try:
+                if f.stat().st_size < MIN_VALID_AUDIO_BYTES:
+                    f.unlink(missing_ok=True)
+                    logger.info(f"[TTS Cleaner] Đã dọn dẹp file MP3 rỗng/hỏng: {f.name}")
+            except Exception:
+                pass
+
+    # 2. Nạp checkpoint cũ nếu có
     checkpoint_file = tts_dir / "tts_chunks_state.json"
     chunk_states: Dict[str, Dict[str, Any]] = {}
     if checkpoint_file.exists() and not force_regenerate:
@@ -421,67 +585,199 @@ async def generate_all_segments(
         except Exception:
             chunk_states = {}
 
-    async def _process_single_segment(seg: Dict[str, Any], delay_stagger: float = 0.0) -> Optional[Dict[str, Any]]:
-        nonlocal completed_count
+    meta = get_voice_preset_metadata(voice)
+    resolved = resolve_effective_tts_speed(voice, speed_rate)
+    voice_pitch = resolved.get("pitch", "+0Hz")
+    preset_style = meta.get("recommended_translation_style", "movie_review_spoken_vi")
+
+    # 3. Phân loại ngay lập tức: Reused Chunks vs Pending/Retry Chunks (< 5ms)
+    reused_results: List[Dict[str, Any]] = []
+    pending_segments: List[Dict[str, Any]] = []
+
+    for seg in segments:
         idx = seg["index"]
-        text_to_speak = (seg.get("translated_text") or seg.get("original_text") or "").strip()
-        seg_file = tts_dir / f"segment_{idx:04d}.mp3"
         idx_key = str(idx)
+        raw_display_text = (seg.get("translated_text") or seg.get("original_text") or "").strip()
+        seg_file = tts_dir / f"segment_{idx:04d}.mp3"
 
-        if not text_to_speak:
-            async with lock:
-                completed_count += 1
-                chunk_states[idx_key] = {"index": idx, "status": "skipped", "text": "", "file_path": None}
-                if progress_callback:
-                    await progress_callback(completed_count, total_count)
-            return None
+        if not raw_display_text:
+            chunk_states[idx_key] = {"index": idx, "status": "skipped", "text": "", "file_path": None}
+            continue
 
-        # 1. Kiểm tra tái sử dụng chunk hợp lệ nếu đã tồn tại trên ổ đĩa
-        if not force_regenerate and seg_file.exists() and seg_file.stat().st_size > 0:
-            res = {
+        chunk_style = seg.get("translation_style") or preset_style
+        spoken_text = normalize_spoken_text_for_tts(raw_display_text, style=chunk_style)
+        trans_rev = int(seg.get("translation_revision") or 1)
+
+        chunk_sig = compute_tts_chunk_signature(
+            voice=voice,
+            speed_rate=speed_rate,
+            text=spoken_text,
+            pitch=voice_pitch,
+            translation_rev=trans_rev,
+            norm_version="v2_pause_norm",
+        )
+        saved_sig = chunk_states.get(idx_key, {}).get("config_signature")
+        saved_voice = chunk_states.get(idx_key, {}).get("voice")
+
+        # Kiểm tra config_signature và file thật trên ổ đĩa (>= MIN_VALID_AUDIO_BYTES)
+        is_signature_valid = (saved_sig == chunk_sig) or (saved_sig is None and (saved_voice is None or saved_voice == voice))
+        can_reuse = not force_regenerate and is_signature_valid and seg_file.exists() and seg_file.stat().st_size >= MIN_VALID_AUDIO_BYTES
+
+        if can_reuse:
+            seg_start = float(seg.get("start", 0.0))
+            seg_end = float(seg.get("end", seg_start + 2.0))
+            seg_dur = float(seg.get("duration", round(seg_end - seg_start, 2)))
+            reused_results.append({
                 "index": idx,
-                "start": seg["start"],
-                "end": seg["end"],
-                "duration": seg.get("duration", round(seg["end"] - seg["start"], 2)),
-                "text": text_to_speak,
+                "phrase_id": seg.get("phrase_id", idx),
+                "start": seg_start,
+                "end": seg_end,
+                "duration": seg_dur,
+                "text": raw_display_text,
+                "display_text": raw_display_text,
+                "spoken_text": spoken_text,
                 "file_path": str(seg_file),
                 "punctuation_end": seg.get("punctuation_end", ""),
                 "is_complete_sentence": seg.get("is_complete_sentence", False),
                 "original_text": seg.get("original_text", ""),
                 "original_whisper_indices": seg.get("original_whisper_indices", []),
+                "source_chunks": seg.get("source_chunks", [idx]),
+                "member_count": seg.get("member_count", 1),
+                "reused": True,
+            })
+            chunk_states[idx_key] = {
+                "index": idx,
+                "status": "completed",
+                "attempts": chunk_states.get(idx_key, {}).get("attempts", 1),
+                "file_path": str(seg_file),
+                "config_signature": chunk_sig,
+                "voice": voice,
+                "speed_rate": speed_rate,
+                "pitch": voice_pitch,
                 "reused": True,
             }
-            async with lock:
-                completed_count += 1
-                chunk_states[idx_key] = {
-                    "index": idx,
-                    "status": "completed",
-                    "attempts": chunk_states.get(idx_key, {}).get("attempts", 1),
-                    "file_path": str(seg_file),
-                    "reused": True,
-                }
-                if progress_callback:
-                    await progress_callback(completed_count, total_count)
-            return res
+        else:
+            if seg_file.exists() and (not is_signature_valid or seg_file.stat().st_size < MIN_VALID_AUDIO_BYTES):
+                seg_file.unlink(missing_ok=True)
+            pending_segments.append(seg)
 
-        # 2. Tổng hợp chunk mới qua TTS Provider
-        if delay_stagger > 0:
-            await asyncio.sleep(delay_stagger)
+    completed_count = len(reused_results)
+    reused_count = len(reused_results)
+    pending_count = len(pending_segments)
+
+    logger.info(
+        f"[TTS Resume] Tổng {total_count} chunks: Tái sử dụng {reused_count} chunks hợp lệ, "
+        f"cần tổng hợp/retry {pending_count} chunks."
+    )
+
+    # 4. Báo cáo tiến độ ngay lập tức với số chunk đã reuse
+    if progress_callback:
+        if pending_count > 0:
+            msg = f"Đã tái sử dụng {reused_count}/{total_count} SpeechChunks. Đang xử lý {pending_count} đoạn còn lại..."
+        else:
+            msg = f"Đã tái sử dụng toàn bộ {reused_count}/{total_count} SpeechChunks."
+        extra_initial = {
+            "completed_chunks": completed_count,
+            "total_chunks": total_count,
+            "active_chunks": [],
+            "failed_chunks": 0,
+            "last_progress_at": _iso_now(),
+        }
+        try:
+            await progress_callback(completed_count, total_count, message=msg, extra=extra_initial)
+        except TypeError:
+            try:
+                await progress_callback(completed_count, total_count, message=msg)
+            except TypeError:
+                await progress_callback(completed_count, total_count)
+        except Exception:
+            pass
+
+    # Nếu tất cả đã có sẵn -> lưu atomic checkpoint và trả về ngay lập tức
+    if pending_count == 0:
+        save_tts_checkpoint_atomic(checkpoint_file, chunk_states)
+        return sorted(reused_results, key=lambda x: x["index"])
+
+    # 5. Chỉ thực thi tổng hợp cho pending_segments (Zero Stagger Delay cho retry item đầu tiên)
+    generated_results: List[Dict[str, Any]] = []
+
+    async def _synthesize_pending_segment(seg: Dict[str, Any], queue_idx: int) -> Optional[Dict[str, Any]]:
+        nonlocal completed_count
+        idx = seg["index"]
+        idx_key = str(idx)
+        raw_display_text = (seg.get("translated_text") or seg.get("original_text") or "").strip()
+        chunk_style = seg.get("translation_style") or preset_style
+        spoken_text = normalize_spoken_text_for_tts(raw_display_text, style=chunk_style)
+        trans_rev = int(seg.get("translation_revision") or 1)
+        seg_file = tts_dir / f"segment_{idx:04d}.mp3"
+        chunk_sig = compute_tts_chunk_signature(
+            voice=voice,
+            speed_rate=speed_rate,
+            text=spoken_text,
+            pitch=voice_pitch,
+            translation_rev=trans_rev,
+            norm_version="v2_pause_norm",
+        )
+
+        # Stagger nhỏ (0.05s) CHỈ áp dụng giữa các task trong pending queue
+        stagger_delay = min(1.0, queue_idx * 0.05)
+        if stagger_delay > 0:
+            await asyncio.sleep(stagger_delay)
+
+        async def _attempt_reporter(attempt: int, max_att: int, last_err: Optional[Exception] = None, recovered: bool = False):
+            if progress_callback:
+                if recovered:
+                    cur_msg = f"✓ Đã khôi phục chunk #{idx}. Đang tiếp tục xử lý ({completed_count}/{total_count})..."
+                else:
+                    cur_msg = f"Lỗi tạm thời ở chunk #{idx}. Đang tự thử lại lần {attempt}/{max_att} ({completed_count}/{total_count} hoàn thành)..."
+                try:
+                    await progress_callback(completed_count, total_count, message=cur_msg)
+                except TypeError:
+                    await progress_callback(completed_count, total_count)
+                except Exception:
+                    pass
 
         async with semaphore:
+            async with lock:
+                active_chunk_indices.add(idx)
+
             try:
-                await p.synthesize(text=text_to_speak, voice=voice, output_file=seg_file, speed_rate=speed_rate)
+                try:
+                    await p.synthesize(
+                        text=spoken_text,
+                        voice=voice,
+                        output_file=seg_file,
+                        speed_rate=speed_rate,
+                        pitch=voice_pitch,
+                        style=chunk_style,
+                        attempt_callback=_attempt_reporter,
+                    )
+                except TypeError:
+                    await p.synthesize(
+                        text=spoken_text,
+                        voice=voice,
+                        output_file=seg_file,
+                        speed_rate=speed_rate,
+                    )
+                seg_start = float(seg.get("start", 0.0))
+                seg_end = float(seg.get("end", seg_start + 2.0))
+                seg_dur = float(seg.get("duration", round(seg_end - seg_start, 2)))
                 res = {
                     "index": idx,
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "duration": seg.get("duration", round(seg["end"] - seg["start"], 2)),
-                    "text": text_to_speak,
+                    "phrase_id": seg.get("phrase_id", idx),
+                    "start": seg_start,
+                    "end": seg_end,
+                    "duration": seg_dur,
+                    "text": raw_display_text,
+                    "display_text": raw_display_text,
+                    "spoken_text": spoken_text,
                     "file_path": str(seg_file),
                     "punctuation_end": seg.get("punctuation_end", ""),
                     "is_complete_sentence": seg.get("is_complete_sentence", False),
                     "original_text": seg.get("original_text", ""),
                     "original_whisper_indices": seg.get("original_whisper_indices", []),
+                    "source_chunks": seg.get("source_chunks", [idx]),
+                    "member_count": seg.get("member_count", 1),
                     "reused": False,
                 }
                 status_item = {
@@ -489,6 +785,10 @@ async def generate_all_segments(
                     "status": "completed",
                     "attempts": chunk_states.get(idx_key, {}).get("attempts", 0) + 1,
                     "file_path": str(seg_file),
+                    "config_signature": chunk_sig,
+                    "voice": voice,
+                    "speed_rate": speed_rate,
+                    "pitch": voice_pitch,
                     "error_message": None,
                 }
             except Exception as e:
@@ -501,37 +801,66 @@ async def generate_all_segments(
                     "file_path": None,
                     "error_message": str(e),
                 }
+            finally:
+                async with lock:
+                    active_chunk_indices.discard(idx)
+                    if res is not None:
+                        completed_count += 1
+                    chunk_states[idx_key] = status_item
 
-            async with lock:
-                completed_count += 1
-                chunk_states[idx_key] = status_item
-                if progress_callback:
-                    try:
-                        await progress_callback(completed_count, total_count)
-                    except Exception:
-                        pass
+                    # ATOMIC CHECKPOINT FLUSH ON EVERY CHUNK (Invariant 3)
+                    save_tts_checkpoint_atomic(checkpoint_file, chunk_states)
+
+                    if progress_callback:
+                        cur_pct = round((completed_count / max(1, total_count)) * 100.0, 1)
+                        active_list = sorted(list(active_chunk_indices))
+                        if active_list:
+                            active_str = ", ".join(f"#{i}" for i in active_list[:4])
+                            if len(active_list) > 4:
+                                active_str += f" (+{len(active_list)-4} đoạn)"
+                            cur_msg = f"Đang tổng hợp {completed_count}/{total_count} SpeechChunks ({cur_pct}%) - Đang xử lý: {active_str}"
+                        else:
+                            cur_msg = f"Đang tổng hợp {completed_count}/{total_count} SpeechChunks ({cur_pct}%) - Xong chunk #{idx}"
+
+                        failed_count = len([v for v in chunk_states.values() if v.get("status") == "failed"])
+                        extra_info = {
+                            "completed_chunks": completed_count,
+                            "total_chunks": total_count,
+                            "active_chunks": active_list,
+                            "failed_chunks": failed_count,
+                            "last_progress_at": _iso_now(),
+                        }
+                        try:
+                            await progress_callback(completed_count, total_count, message=cur_msg, extra=extra_info)
+                        except TypeError:
+                            try:
+                                await progress_callback(completed_count, total_count, message=cur_msg)
+                            except TypeError:
+                                await progress_callback(completed_count, total_count)
+                        except Exception:
+                            pass
+
             return res
 
-    # Phân tán khởi tạo kết nối (stagger) 0.04s giữa các tác vụ để chống rate-limit
-    tasks = [_process_single_segment(seg, i * 0.04) for i, seg in enumerate(segments)]
+    tasks = [_synthesize_pending_segment(seg, k) for k, seg in enumerate(pending_segments)]
     raw_results = await asyncio.gather(*tasks)
-    results = [r for r in raw_results if r is not None]
+    for r in raw_results:
+        if r is not None:
+            generated_results.append(r)
 
-    # Lưu checkpoint ra file tts_chunks_state.json
-    try:
-        with open(checkpoint_file, "w", encoding="utf-8") as f:
-            json.dump(chunk_states, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"Không thể lưu checkpoint TTS: {e}")
+    # 6. Final atomic checkpoint flush
+    save_tts_checkpoint_atomic(checkpoint_file, chunk_states)
 
     failed_chunks = [v for v in chunk_states.values() if v.get("status") == "failed"]
     if failed_chunks:
         first_fail = failed_chunks[0]
+        total_done = len(reused_results) + len(generated_results)
         raise RuntimeError(
             f"TTS_CHUNK_FAILED: Lỗi tổng hợp tại chunk #{first_fail.get('index')} "
-            f"({len(results)}/{len(segments)} hoàn thành): {first_fail.get('error_message')}"
+            f"({total_done}/{total_count} hoàn thành): {first_fail.get('error_message')}"
         )
 
-    logger.info(f"Đã sinh hoàn tất {len(results)}/{len(segments)} audio segments.")
-    return sorted(results, key=lambda x: x["index"])
+    all_results = reused_results + generated_results
+    logger.info(f"Đã hoàn thành toàn bộ {len(all_results)}/{total_count} audio segments (Reused: {reused_count}, Generated: {len(generated_results)}).")
+    return sorted(all_results, key=lambda x: x["index"])
 

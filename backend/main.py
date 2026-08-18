@@ -5,8 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.api.routes import router as api_router
-from backend.config import FRONTEND_DIR, HOST, PORT
+from backend.config import FRONTEND_DIR, HOST, PORT, RUNTIME_INSTANCE_ID
 from backend.utils.ffmpeg_utils import is_ffmpeg_available
+from backend.utils.job_store import recover_stale_running_jobs
 
 # Cấu hình logging
 logging.basicConfig(
@@ -20,11 +21,23 @@ logger = logging.getLogger("main")
 async def lifespan(app: FastAPI):
     logger.info("==================================================")
     logger.info("   AI VIDEO TRANSLATOR & DUBBING SERVER STARTING   ")
+    logger.info(f"   RUNTIME_INSTANCE_ID: {RUNTIME_INSTANCE_ID}")
     logger.info("==================================================")
     if is_ffmpeg_available():
         logger.info("✓ FFmpeg & FFprobe: Đã phát hiện và sẵn sàng hoạt động.")
     else:
         logger.warning("✗ FFmpeg: Chưa được cài đặt hoặc không tìm thấy trong PATH!")
+
+    # Khởi động Watchdog thu hồi các tác vụ zombie do server khởi động lại (Invariant 4)
+    try:
+        recovered = await recover_stale_running_jobs()
+        if recovered:
+            logger.info(f"[WATCHDOG] Đã phát hiện và phục hồi {len(recovered)} zombie jobs: {', '.join(recovered)}")
+        else:
+            logger.info("[WATCHDOG] Không có zombie job nào cần thu hồi.")
+    except Exception as e:
+        logger.error(f"[WATCHDOG] Lỗi khi thu hồi zombie jobs lúc khởi động: {e}", exc_info=True)
+
     logger.info(f"Frontend running at: http://{HOST}:{PORT}")
     logger.info("==================================================")
     yield
@@ -46,6 +59,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.endswith((".js", ".css", ".html")) or path == "/" or "/js/" in path or "/css/" in path:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 
 # Đăng ký các API routes
 app.include_router(api_router)

@@ -173,13 +173,19 @@ CRITICAL GUIDELINES FOR TIKTOK MOVIE REVIEW SPOKEN STYLE:
 1. Maintain the exact same number of items and matching 'index'.
 2. DRAMATIC & FAST-PACED SPOKEN STYLE (PHONG CÁCH REVIEW PHIM TIKTOK KỊCH TÍNH & CUỐN HÚT):
    - Translate specifically for fast-paced, engaging short-form video commentary.
-   - Use punchy, gripping, conversational phrases that hook the audience (e.g., "Không ngờ rằng...", "Ngay lúc này...", "Hóa ra là...", "Và rồi điều kinh hoàng đã xảy ra...").
+   - Use punchy, gripping, conversational phrases that hook the audience (e.g., "Không ngờ rằng", "Ngay lúc này", "Hóa ra là", "Và rồi điều kinh hoàng đã xảy ra").
    - Eliminate filler words and stiff written syntax. Sentences must be snappy, rhythmic, and ready for rapid voice-over.
-3. DURATION-AWARE & NATURAL COMPACTNESS (TỐI ƯU ĐỘ DÀI & ĐỘ CÔ ĐỌNG THEO THỜI LƯỢNG):
+3. SPOKEN PUNCTUATION & FLOW (QUY TẮC DẤU CÂU CHO VĂN NÓI THUYẾT MINH):
+   - DO NOT overuse ellipsis '...'. DO NOT use '...' to connect normal continuing clauses.
+   - Use comma ',' when the sentence or thought is continuing smoothly to prevent unnatural audio pauses.
+   - Only use '...' when there is genuine hesitation, suspense, or a dramatic cliffhanger at the very end of a thought.
+   - NEVER create duplicate ellipsis like '... ...', '……', or '....'.
+   - Optimize for continuous, natural spoken flow for fast-paced voice-over.
+4. DURATION-AWARE & NATURAL COMPACTNESS (TỐI ƯU ĐỘ DÀI & ĐỘ CÔ ĐỌNG THEO THỜI LƯỢNG):
    - Each item includes a 'duration' (seconds). Ensure the Vietnamese sentence can be spoken smoothly within approximately that duration.
    - Prioritize concise, vivid expressions over wordy literal translations.
    - Preserve all crucial facts, proper names, and core message. DO NOT hallucinate or fabricate events.
-4. FORMAT:
+5. FORMAT:
    - Return ONLY a valid JSON array of objects with 'index' (integer) and 'translated_text' (string). No markdown, notes, or extra commentary.
 """
     elif translation_style == "natural_commentary":
@@ -190,13 +196,16 @@ CRITICAL GUIDELINES FOR SPOKEN COMMENTARY:
 1. Maintain the exact same number of items and matching 'index'.
 2. NATURAL COMMENTARY STYLE (VĂN PHONG BÌNH LUẬN / THUYẾT MINH NĂNG ĐỘNG):
    - Translate for conversational voice-over / dubbing, NOT formal academic written text.
-   - Use direct, lively, punchy phrasing (e.g., "Nhưng vấn đề là...", "Và tiếp theo...", "Chính vì thế...").
+   - Use direct, lively, punchy phrasing (e.g., "Nhưng vấn đề là,", "Và tiếp theo,", "Chính vì thế,").
    - Sentences must sound energetic, rhythmic, and easy to speak aloud fluently.
-3. DURATION-AWARE & NATURAL COMPACTNESS:
+3. SPOKEN PUNCTUATION & FLOW:
+   - Prefer commas ',' for natural breathing pauses between clauses. Avoid unnecessary '...'.
+   - NEVER create duplicate punctuation like '... ...' or ',,'.
+4. DURATION-AWARE & NATURAL COMPACTNESS:
    - Each item includes a 'duration' (seconds). Ensure the sentence fits naturally within approximately that duration.
    - Concise, natural expressions over wordy literal translations.
    - Preserve all core facts, game terms, and meaning.
-4. FORMAT:
+5. FORMAT:
    - Return ONLY a valid JSON array of objects with 'index' (integer) and 'translated_text' (string). No markdown, notes, or extra commentary.
 """
     else:  # standard_dubbing (default)
@@ -208,10 +217,13 @@ CRITICAL GUIDELINES FOR SPOKEN DUBBING:
 2. NATURAL SPOKEN DUBBING STYLE (VĂN PHONG LỒNG TIẾNG TỰ NHIÊN):
    - Translate specifically for voice-over / dubbing, natural spoken syntax and smooth flow.
    - Clear, articulate, emotionally fitting expressions.
-3. DURATION-AWARE & NATURAL COMPACTNESS:
+3. SPOKEN PUNCTUATION & FLOW:
+   - Use standard punctuation appropriately. Prefer comma ',' over ellipsis '...' for continuous clauses.
+   - Never use duplicate ellipsis '... ...'.
+4. DURATION-AWARE & NATURAL COMPACTNESS:
    - Each item includes a 'duration' (seconds). Ensure the sentence can be spoken comfortably within approximately that duration.
    - Preserve all facts, nuances, proper names, and core message.
-4. FORMAT:
+5. FORMAT:
    - Return ONLY a valid JSON array of objects with 'index' (integer) and 'translated_text' (string). No markdown, notes, or extra commentary.
 """
 
@@ -352,6 +364,9 @@ RULES:
     return current_translation
 
 
+from backend.utils.retry_utils import get_retry_after_delay, is_fatal_api_key_error, is_recoverable_error
+
+
 async def translate_transcript_segments(
     transcript_file: Optional[Path] = None,
     output_translated_file: Optional[Path] = None,
@@ -360,12 +375,17 @@ async def translate_transcript_segments(
     api_key: Optional[str] = None,
     batch_size: int = 25,
     translation_style: str = "standard_dubbing",
+    progress_callback: Optional[Any] = None,
+    force_regenerate: bool = False,
     *,
     transcript_json_path: Optional[Path] = None,
     output_json_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
-    Dịch toàn bộ transcript JSON theo batch và lưu kết quả bản dịch, hỗ trợ translation_style.
+    Dịch toàn bộ transcript JSON theo batch hỗ trợ Batch-Level Checkpoint & Resume:
+    - Kiểm tra và tái sử dụng các câu/batch đã dịch trước đó.
+    - Phân loại lỗi: Lỗi API Key sai dừng ngay lập tức (0 lượt retry), lỗi mạng/5xx/429 tự động retry tối đa 3 lần.
+    - Cập nhật tiến độ và checkpoint đĩa sau mỗi batch thành công.
     """
     input_file = transcript_file or transcript_json_path
     if not input_file or not input_file.exists():
@@ -381,6 +401,8 @@ async def translate_transcript_segments(
         data = json.loads(content)
 
     segments = data.get("speech_chunks") or data.get("segments", [])
+    total_segments = len(segments)
+
     if not segments:
         logger.info("File transcript không chứa đoạn thoại nào cần dịch.")
         empty_res = {
@@ -398,6 +420,22 @@ async def translate_transcript_segments(
                 await f.write(json.dumps(empty_res, indent=2, ensure_ascii=False))
         return empty_res
 
+    # 1. Nạp các câu đã dịch từ file checkpoint nếu có
+    all_translations: Dict[int, str] = {}
+    if not force_regenerate and output_translated_file.exists():
+        try:
+            async with aiofiles.open(output_translated_file, "r", encoding="utf-8") as out_f:
+                prev_data = json.loads(await out_f.read())
+                prev_chunks = prev_data.get("speech_chunks") or prev_data.get("segments", [])
+                for pc in prev_chunks:
+                    p_idx = pc.get("index")
+                    p_text = (pc.get("translated_text") or "").strip()
+                    if p_idx and p_text and p_text != pc.get("original_text"):
+                        all_translations[int(p_idx)] = p_text
+        except Exception as e:
+            logger.warning(f"Không thể đọc checkpoint bản dịch cũ: {e}")
+
+    # Lấy API key (hoặc raise lỗi nếu chưa có)
     key = _get_api_key(api_key)
 
     detected_lang = data.get("detected_language", "en")
@@ -405,66 +443,169 @@ async def translate_transcript_segments(
     src_name = LANGUAGE_NAMES.get(src_lang.lower(), f"language '{src_lang}'")
     tgt_name = LANGUAGE_NAMES.get(target_language.lower(), f"language '{target_language}'")
 
+    # Lọc các segments chưa được dịch
+    pending_segments = [s for s in segments if int(s["index"]) not in all_translations]
+    reused_count = len(all_translations)
+    completed_count = reused_count
+
     logger.info(
-        f"Bắt đầu dịch {len(segments)} segments từ {src_name} sang {tgt_name} (style='{translation_style}')..."
+        f"[Translation Resume] Tổng {total_segments} câu: Tái sử dụng {reused_count} câu đã dịch, "
+        f"cần dịch {len(pending_segments)} câu (style='{translation_style}')."
     )
 
-    # Chia segments thành các batch nhỏ
-    batches = [segments[i : i + batch_size] for i in range(0, len(segments), batch_size)]
-    all_translations: Dict[int, str] = {}
+    if progress_callback:
+        initial_msg = (
+            f"Đã tái sử dụng {reused_count}/{total_segments} câu dịch. Đang xử lý {len(pending_segments)} câu còn lại..."
+            if reused_count > 0
+            else f"Bắt đầu dịch {total_segments} câu thoại sang {tgt_name}..."
+        )
+        try:
+            await progress_callback(completed_count, total_segments, message=initial_msg)
+        except TypeError:
+            await progress_callback(completed_count, total_segments)
+        except Exception:
+            pass
 
+    # Nếu tất cả đã có sẵn -> Lưu và trả về ngay
+    if not pending_segments:
+        for seg in segments:
+            seg["translated_text"] = all_translations.get(int(seg["index"]), seg.get("original_text", ""))
+        result_data = {
+            "source_language": src_lang,
+            "source_language_name": src_name,
+            "target_language": target_language,
+            "target_language_name": tgt_name,
+            "translation_style": translation_style,
+            "model_used": _CONFIRMED_WORKING_MODEL or "gemini-2.0-flash",
+            "total_segments": total_segments,
+            "translated_segments": len(all_translations),
+            "duration": data.get("duration", 0),
+            "segments": segments,
+            "speech_chunks": segments,
+        }
+        output_translated_file.parent.mkdir(parents=True, exist_ok=True)
+        async with aiofiles.open(output_translated_file, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(result_data, indent=2, ensure_ascii=False))
+        return result_data
+
+    # Chia các pending segments thành các batch
+    batches = [pending_segments[i : i + batch_size] for i in range(0, len(pending_segments), batch_size)]
     loop = asyncio.get_running_loop()
 
-    for idx, batch in enumerate(batches, start=1):
-        logger.info(f"Đang xử lý Batch {idx}/{len(batches)} ({len(batch)} câu, style='{translation_style}')...")
-        translations = await loop.run_in_executor(
-            None,
-            _translate_batch_sync,
-            key,
-            batch,
-            src_name,
-            tgt_name,
-            translation_style,
-        )
-        all_translations.update(translations)
+    for b_idx, batch in enumerate(batches, start=1):
+        batch_indices = [s["index"] for s in batch]
+        idx_range_str = f"#{batch_indices[0]}-#{batch_indices[-1]}" if len(batch_indices) > 1 else f"#{batch_indices[0]}"
+        logger.info(f"Đang xử lý Batch {b_idx}/{len(batches)} ({len(batch)} câu, đoạn {idx_range_str})...")
 
-    # Gán bản dịch vào từng segment
-    translated_count = 0
-    for seg in segments:
-        seg_idx = seg["index"]
-        if seg_idx in all_translations:
-            seg["translated_text"] = all_translations[seg_idx]
-            translated_count += 1
-        elif not seg.get("translated_text"):
-            seg["translated_text"] = seg.get("original_text", "")
+        # Thực thi auto-retry tối đa 3 lần cho riêng batch này
+        max_batch_attempts = 3
+        batch_success = False
+        last_batch_error = None
+        backoff_delays = [1.0, 2.0, 4.0]
 
-    result_data = {
-        "source_language": src_lang,
-        "source_language_name": src_name,
-        "target_language": target_language,
-        "target_language_name": tgt_name,
-        "translation_style": translation_style,
-        "model_used": _CONFIRMED_WORKING_MODEL or "gemini-2.0-flash",
-        "total_segments": len(segments),
-        "translated_segments": translated_count,
-        "duration": data.get("duration", 0),
-        "segments": segments,
-        "speech_chunks": segments,
-    }
+        for attempt in range(1, max_batch_attempts + 1):
+            if attempt > 1 and progress_callback:
+                retry_msg = f"Đang dịch {completed_count}/{total_segments} câu. Lỗi tạm thời ở batch {b_idx} ({idx_range_str}), đang tự thử lại lần {attempt}/{max_batch_attempts}..."
+                try:
+                    await progress_callback(completed_count, total_segments, message=retry_msg)
+                except TypeError:
+                    await progress_callback(completed_count, total_segments)
+                except Exception:
+                    pass
 
-    # Đảm bảo thư mục lưu trữ tồn tại
-    output_translated_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                translations = await loop.run_in_executor(
+                    None,
+                    _translate_batch_sync,
+                    key,
+                    batch,
+                    src_name,
+                    tgt_name,
+                    translation_style,
+                )
+                all_translations.update(translations)
+                completed_count = len(all_translations)
+                batch_success = True
 
-    # Lưu file translated_transcript.json
-    async with aiofiles.open(output_translated_file, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(result_data, indent=2, ensure_ascii=False))
+                if attempt > 1 and progress_callback:
+                    rec_msg = f"✓ Đã khôi phục. Đang tiếp tục dịch ({completed_count}/{total_segments} câu)..."
+                    try:
+                        await progress_callback(completed_count, total_segments, message=rec_msg)
+                    except TypeError:
+                        await progress_callback(completed_count, total_segments)
+                    except Exception:
+                        pass
+                break
+
+            except Exception as e:
+                last_batch_error = e
+                # Nếu là lỗi API Key sai: Dừng ngay lập tức, KHÔNG thử lại
+                if is_fatal_api_key_error(e):
+                    logger.error(f"Phát hiện lỗi Fatal Gemini API Key: {e}. Dừng ngay lập tức.")
+                    raise RuntimeError(
+                        "Khóa Gemini API không hợp lệ hoặc đã hết hạn (API_KEY_INVALID). "
+                        "Vui lòng bấm 'Thay đổi' tại mục Cấu hình dịch thuật để nhập API Key mới và thử lại."
+                    ) from e
+
+                if not is_recoverable_error(e):
+                    logger.error(f"Lỗi dịch thuật không thể tự phục hồi tại batch {b_idx}: {e}")
+                    raise e
+
+                if attempt < max_batch_attempts:
+                    wait_sec = get_retry_after_delay(e, backoff_delays[min(attempt - 1, len(backoff_delays) - 1)])
+                    logger.warning(
+                        f"Lỗi tạm thời khi dịch batch {b_idx} (Lần {attempt}/{max_batch_attempts}): {e}. Chờ {wait_sec:.1f}s trước khi thử lại..."
+                    )
+                    await asyncio.sleep(wait_sec)
+
+        if not batch_success:
+            raise RuntimeError(
+                f"TRANSLATION_BATCH_FAILED: Lỗi dịch thuật tại batch {b_idx} (đoạn {idx_range_str}) "
+                f"sau {max_batch_attempts} lần thử tự động: {last_batch_error}"
+            )
+
+        # Cập nhật checkpoint tức thì ra file sau mỗi batch thành công
+        for seg in segments:
+            seg_idx = int(seg["index"])
+            if seg_idx in all_translations:
+                seg["translated_text"] = all_translations[seg_idx]
+            elif not seg.get("translated_text"):
+                seg["translated_text"] = seg.get("original_text", "")
+
+        partial_result = {
+            "source_language": src_lang,
+            "source_language_name": src_name,
+            "target_language": target_language,
+            "target_language_name": tgt_name,
+            "translation_style": translation_style,
+            "model_used": _CONFIRMED_WORKING_MODEL or "gemini-2.0-flash",
+            "total_segments": total_segments,
+            "translated_segments": completed_count,
+            "duration": data.get("duration", 0),
+            "segments": segments,
+            "speech_chunks": segments,
+        }
+
+        output_translated_file.parent.mkdir(parents=True, exist_ok=True)
+        async with aiofiles.open(output_translated_file, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(partial_result, indent=2, ensure_ascii=False))
+
+        if progress_callback:
+            cur_pct = round((completed_count / max(1, total_segments)) * 100.0, 1)
+            msg = f"Đang dịch {completed_count}/{total_segments} câu thoại ({cur_pct}%) - Xong batch {b_idx}/{len(batches)}"
+            try:
+                await progress_callback(completed_count, total_segments, message=msg)
+            except TypeError:
+                await progress_callback(completed_count, total_segments)
+            except Exception:
+                pass
 
     # Đồng bộ cập nhật lại file transcript.json
     async with aiofiles.open(transcript_file, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(result_data, indent=2, ensure_ascii=False))
+        await f.write(json.dumps(partial_result, indent=2, ensure_ascii=False))
 
     logger.info(
-        f"Hoàn thành dịch thuật ({translated_count}/{len(segments)} câu, style='{translation_style}'). Lưu tại: {output_translated_file.name}"
+        f"Hoàn thành dịch thuật ({completed_count}/{total_segments} câu, style='{translation_style}'). Lưu tại: {output_translated_file.name}"
     )
 
-    return result_data
+    return partial_result

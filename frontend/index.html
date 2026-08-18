@@ -3,13 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>AI DUBBING STUDIO - Tách giọng, Dịch thuật & Lồng tiếng AI</title>
   <meta name="description" content="AI DUBBING STUDIO - Nền tảng chuyên nghiệp tách giọng, nhận diện STT, dịch thuật ngữ cảnh và lồng tiếng AI chất lượng cao.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Montserrat:wght@500;700;800&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/css/style.css">
-  <link rel="stylesheet" href="./css/style.css">
+  <link rel="stylesheet" href="./css/style.css?v=2.2">
 </head>
 <body>
   <div class="app-container">
@@ -381,6 +383,26 @@
           </div>
         </div>
 
+        <!-- Card 4.5: Vùng che (Mask & Blur Regions) -->
+        <div class="studio-card" id="maskRegionsCard">
+          <div class="card-heading" style="display: flex; justify-content: space-between; align-items: center;">
+            <span>VÙNG CHE (MASK / BLUR)</span>
+            <button type="button" id="addMaskRegionBtn" class="btn-action-small" style="font-size: 0.70rem; padding: 0.2rem 0.55rem; background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.35);">+ Thêm vùng che</button>
+          </div>
+
+          <div style="font-size: 0.72rem; color: #f59e0b; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.2); border-radius: 6px; padding: 0.35rem 0.55rem; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.35rem;">
+            <span>💡</span>
+            <span>Kéo & phóng to/thu nhỏ vùng che trên video. Phụ đề luôn nằm trên vùng che.</span>
+          </div>
+
+          <div id="maskRegionsList" class="mask-regions-list" style="display: flex; flex-direction: column; gap: 0.45rem;">
+            <!-- Rendered by JS -->
+            <div id="emptyMasksPlaceholder" style="font-size: 0.72rem; color: var(--text-dim); text-align: center; padding: 0.5rem; border: 1px dashed var(--border-subtle); border-radius: var(--radius-sm);">
+              Chưa có vùng che nào. Bấm "+ Thêm vùng che" để tạo.
+            </div>
+          </div>
+        </div>
+
         <!-- Card 5: Tùy chọn xử lý (Pipeline Options) -->
         <div class="studio-card" id="optionsCard">
           <div class="card-heading">
@@ -492,23 +514,29 @@
             <span class="video-pill" id="videoBadgeFps">🎬 —</span>
           </div>
 
-          <!-- Video Player Frame + Live Subtitle Overlay (Phase 6) -->
+          <!-- Video Player Frame + Live Subtitle Overlay + Mask Layers (Z-order: Video 1 -> Mask 10 -> Subtitle 20 -> Editor 30) -->
           <div class="video-player-frame" id="videoFrameWrapper">
             <video id="videoPreview" class="main-video-element" controls></video>
             
-            <!-- Live Real-Time Subtitle DOM Overlay -->
-            <div class="subtitle-live-overlay" id="subtitleLiveOverlay"></div>
+            <!-- Layer 1 (z=10): Mask / Blur Regions Overlay -->
+            <div class="video-canvas-layer mask-canvas-layer" id="maskCanvasLayer"></div>
+
+            <!-- Layer 2 (z=20): Live Real-Time Subtitle DOM Overlay -->
+            <div class="video-canvas-layer subtitle-live-overlay" id="subtitleLiveOverlay"></div>
+
+            <!-- Layer 3 (z=30): Editor Interaction / Selection Handles Layer -->
+            <div class="video-canvas-layer editor-interaction-layer" id="editorInteractionLayer"></div>
 
             <!-- Dropzone Overlay for Easy Drag & Drop (Supports 1-5 videos) -->
             <div class="video-drop-overlay" id="dropzone">
               <div class="drop-icon-large">🎬</div>
               <div class="drop-title">Kéo & thả video vào đây (1–5 video)</div>
               <div class="drop-subtitle">Hỗ trợ tải lên cùng lúc tối đa 5 file (MP4, MOV, MKV, WEBM - Tối đa 500MB)</div>
-              <button type="button" class="btn-ghost-dark" id="selectBtn" style="margin-top: 0.4rem;">
+              <label for="fileInput" class="btn-ghost-dark" id="selectBtn" style="margin-top: 0.4rem; cursor: pointer;">
                 Chọn file video
-              </button>
+              </label>
             </div>
-            <input type="file" id="fileInput" style="display: none;" accept=".mp4,.mov,.mkv,.webm" multiple>
+            <input type="file" id="fileInput" style="position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none;" accept="video/*,.mp4,.mov,.mkv,.webm" multiple>
           </div>
 
           <!-- Realtime Progress Bar -->
@@ -756,6 +784,6 @@
   <div class="toast-container" id="toastContainer"></div>
 
   <!-- Main JavaScript -->
-  <script type="module" src="./js/app.js"></script>
+  <script type="module" src="./js/app.js?v=2.2"></script>
 </body>
 </html>

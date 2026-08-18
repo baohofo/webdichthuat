@@ -51,8 +51,11 @@ def compute_pipeline_metrics(
 
     # 3. Đo lường Pause Profile & Khoảng lặng
     pauses = [float(p) for p in sync_stats.get("pauses", []) if p > 0.0]
-    avg_pause_dur = round(sum(pauses) / max(1, len(pauses)), 3) if pauses else 0.0
-    long_pause_count = sum(1 for p in pauses if p > 0.8)
+    avg_pause_dur = sync_stats.get("average_pause_duration") or (round(sum(pauses) / max(1, len(pauses)), 3) if pauses else 0.0)
+    max_pause_dur = sync_stats.get("max_pause_duration") or (round(max(pauses), 3) if pauses else 0.0)
+    pause_profile_name = sync_stats.get("pause_profile", "standard")
+    pause_warn_thresh = 0.60 if pause_profile_name == "movie_review" else 0.80
+    long_pause_count = sync_stats.get("long_pause_count", sum(1 for p in pauses if p > pause_warn_thresh))
 
     # 4. Đo lường atempo & Multi-layer Effective Speed
     speedups = [float(sp) for sp in sync_stats.get("speedups", [])]
@@ -105,7 +108,9 @@ def compute_pipeline_metrics(
         # Pause metrics
         "pause_profile": sync_stats.get("pause_profile", "standard"),
         "average_pause_duration": avg_pause_dur,
+        "max_pause_duration": max_pause_dur,
         "long_pause_count": long_pause_count,
+        "chunk_diagnostics": sync_stats.get("chunk_diagnostics", []),
         # Subtitle metrics
         "average_subtitle_duration": avg_sub_dur,
         "average_cps": avg_cps,

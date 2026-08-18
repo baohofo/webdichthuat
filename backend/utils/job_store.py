@@ -7,9 +7,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from backend.config import CANONICAL_STAGE_ORDER, MIN_VALID_AUDIO_BYTES, RUNTIME_INSTANCE_ID, JOBS_DIR
 from backend.utils.file_utils import get_job_paths
 
 logger = logging.getLogger("job_store")
+
+# Task Registry theo dõi in-memory các Background Tasks đang thực thi (Invariant 6)
+ACTIVE_BACKGROUND_TASKS: Dict[str, asyncio.Task] = {}
+
+
+def register_active_task(job_id: str, task: asyncio.Task) -> None:
+    ACTIVE_BACKGROUND_TASKS[job_id] = task
+
+
+def unregister_active_task(job_id: str) -> None:
+    ACTIVE_BACKGROUND_TASKS.pop(job_id, None)
+
+
+def get_active_task(job_id: str) -> Optional[asyncio.Task]:
+    return ACTIVE_BACKGROUND_TASKS.get(job_id)
+
 
 STAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "upload": {"label": "Tải video lên", "weight": 5},
@@ -23,6 +40,38 @@ STAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "render": {"label": "Render Video hoàn chỉnh (H.264 + AAC 48kHz)", "weight": 10},
 }
 
+CONFIG_DEPENDENCIES: Dict[str, List[str]] = {
+    # Voice & Speech synthesis settings
+    "voice_id": ["tts", "audio_sync", "render"],
+    "speed_rate": ["tts", "audio_sync", "render"],
+    "pitch": ["tts", "audio_sync", "render"],
+
+    # Audio Mixing settings
+    "voice_volume": ["render"],
+    "background_volume": ["render"],
+    "keep_background_audio": ["render"],
+
+    # Subtitle & Mask settings
+    "subtitle_style": ["subtitle", "render"],
+    "subtitle_enabled": ["subtitle", "render"],
+    "subtitle_mode": ["subtitle", "render"],
+    "burn_subtitles": ["subtitle", "render"],
+    "create_subtitle": ["subtitle", "render"],
+    "mask_regions": ["render"],
+
+    # Resolution & Output format
+    "output_resolution": ["render"],
+    "output_format": ["render"],
+
+    # Translation settings
+    "translation_style": ["translation", "tts", "audio_sync", "subtitle", "render"],
+    "target_language": ["translation", "tts", "audio_sync", "subtitle", "render"],
+    "source_language": ["stt", "translation", "tts", "audio_sync", "subtitle", "render"],
+
+    # STT Whisper settings
+    "whisper_model": ["stt", "translation", "tts", "audio_sync", "subtitle", "render"],
+}
+
 _JOB_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
@@ -34,6 +83,56 @@ def _get_job_lock(job_id: str) -> asyncio.Lock:
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def compute_dirty_stages(
+    old_config: Optional[Dict[str, Any]],
+    new_config: Dict[str, Any],
+    current_stages: Dict[str, Any],
+) -> List[str]:
+    """
+    So sánh cấu hình cũ và cấu hình mới theo CONFIG_DEPENDENCIES để xác định chính xác danh sách các stage bị dirty.
+    - Nếu old_config là rỗng hoặc chưa từng chạy thành công: dirty toàn bộ các stage được bật.
+    - Nếu thay đổi config: Chỉ đánh dấu dirty các downstream stages tương ứng.
+    - Nếu một stage chưa 'completed' trên đĩa: Stage đó và các downstream stages mặc định là dirty.
+    - Kết quả trả về được sắp xếp theo CANONICAL_STAGE_ORDER.
+    """
+    if not old_config:
+        return [s for s in CANONICAL_STAGE_ORDER if current_stages.get(s, {}).get("status") != "skipped"]
+
+    dirty_set: set = set()
+
+    # 1. So sánh từng key trong CONFIG_DEPENDENCIES
+    for key, affected_stages in CONFIG_DEPENDENCIES.items():
+        old_val = old_config.get(key)
+        new_val = new_config.get(key)
+        if old_val != new_val:
+            for s in affected_stages:
+                dirty_set.add(s)
+
+    # 2. Kiểm tra cờ kích hoạt lại stage nếu có
+    if new_config.get("run_stt") and not old_config.get("run_stt"):
+        for s in ["stt", "translation", "tts", "audio_sync", "subtitle", "render"]:
+            dirty_set.add(s)
+    if new_config.get("run_translation") and not old_config.get("run_translation"):
+        for s in ["translation", "tts", "audio_sync", "subtitle", "render"]:
+            dirty_set.add(s)
+    if new_config.get("run_tts") and not old_config.get("run_tts"):
+        for s in ["tts", "audio_sync", "render"]:
+            dirty_set.add(s)
+
+    # 3. Kiểm tra các stage chưa hoàn thành trong pipeline hiện tại
+    for s_name in CANONICAL_STAGE_ORDER:
+        st = current_stages.get(s_name, {})
+        if st.get("status") not in ["completed", "skipped"]:
+            dirty_set.add(s_name)
+
+    if not dirty_set:
+        return []
+
+    # Sắp xếp các stage bị dirty theo CANONICAL_STAGE_ORDER
+    dirty_stages = [s for s in CANONICAL_STAGE_ORDER if s in dirty_set and current_stages.get(s, {}).get("status") != "skipped"]
+    return dirty_stages
 
 
 def create_initial_job_state(job_id: str) -> Dict[str, Any]:
@@ -52,6 +151,9 @@ def create_initial_job_state(job_id: str) -> Dict[str, Any]:
             "progress": None,
             "message": "Chờ xử lý",
             "error_code": None,
+            "automatic_attempt": None,
+            "max_automatic_attempts": 3,
+            "is_retrying": False,
             "extra": {},
         }
 
@@ -60,8 +162,11 @@ def create_initial_job_state(job_id: str) -> Dict[str, Any]:
         "status": "uploaded",
         "current_stage": None,
         "progress": 0.0,
+        "output_revision": 0,
+        "config_revision": 0,
         "created_at": _iso_now(),
         "stages": stages,
+        "artifacts": {},
     }
 
 
@@ -173,12 +278,18 @@ async def load_job_info(job_id: str) -> Optional[Dict[str, Any]]:
     return await loop.run_in_executor(None, load_job_info_sync, job_id)
 
 
-async def start_stage(job_id: str, stage_name: str, message: Optional[str] = None) -> Dict[str, Any]:
+async def start_stage(
+    job_id: str,
+    stage_name: str,
+    message: Optional[str] = None,
+    initial_progress: Optional[float] = None,
+) -> Dict[str, Any]:
     """
     Bắt đầu thực thi một stage:
     - Đặt status = 'running'
     - Ghi nhận started_at
     - Cập nhật current_stage và tính lại global progress
+    - initial_progress: Nếu được cung cấp (ví dụ nạp từ checkpoint TTS 95.5%), giữ nguyên thay vì reset về 0.0.
     """
     lock = _get_job_lock(job_id)
     async with lock:
@@ -201,8 +312,15 @@ async def start_stage(job_id: str, stage_name: str, message: Optional[str] = Non
         st["started_at"] = _iso_now()
         st["completed_at"] = None
         st["duration_ms"] = None
-        st["progress"] = 0.0
+        if initial_progress is not None:
+            st["progress"] = initial_progress
+        elif st.get("progress") is not None and st.get("progress", 0.0) > 0.0:
+            st["progress"] = st.get("progress")
+        else:
+            st["progress"] = 0.0
         st["error_code"] = None
+        st["automatic_attempt"] = None
+        st["is_retrying"] = False
         if message:
             st["message"] = message
 
@@ -248,6 +366,50 @@ async def update_stage_progress(
         return job_info
 
 
+async def update_stage_retry(
+    job_id: str,
+    stage_name: str,
+    attempt: int,
+    max_attempts: int = 3,
+    message: Optional[str] = None,
+    progress: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Cập nhật trạng thái Auto-Retry realtime của stage:
+    - automatic_attempt: Lần thử lại hiện tại (1, 2, 3)
+    - is_retrying: True
+    - Giữ nguyên progress đã hoàn thành (không nhảy về 0%)
+    - message: Thông báo thử lại (ví dụ: 'Đang tự thử lại lần 1/3...')
+    """
+    lock = _get_job_lock(job_id)
+    async with lock:
+        job_info = await load_job_info(job_id)
+        if not job_info:
+            return {}
+
+        stages = job_info.setdefault("stages", {})
+        if stage_name in stages:
+            st = stages[stage_name]
+            st["status"] = "running"
+            st["automatic_attempt"] = attempt
+            st["max_automatic_attempts"] = max_attempts
+            st["is_retrying"] = True
+            if progress is not None:
+                st["progress"] = round(float(progress), 1)
+            if message is not None:
+                st["message"] = message
+            else:
+                st["message"] = f"Lỗi tạm thời. Đang tự thử lại lần {attempt}/{max_attempts}..."
+            if extra:
+                st.setdefault("extra", {}).update(extra)
+
+            job_info["status"] = "processing"
+            job_info["progress"] = calculate_global_progress(stages)
+            await save_job_info_atomic(job_id, job_info)
+        return job_info
+
+
 async def complete_stage(
     job_id: str,
     stage_name: str,
@@ -258,6 +420,7 @@ async def complete_stage(
     Hoàn tất một stage:
     - Đặt status = 'completed'
     - Ghi nhận completed_at và tính toán duration_ms thực tế
+    - Xóa trạng thái retry
     - Tính lại global progress
     """
     lock = _get_job_lock(job_id)
@@ -272,6 +435,8 @@ async def complete_stage(
         now_iso = _iso_now()
         st["completed_at"] = now_iso
         st["progress"] = 100.0
+        st["automatic_attempt"] = None
+        st["is_retrying"] = False
 
         if message:
             st["message"] = message
@@ -322,6 +487,7 @@ async def fail_stage(
         st["completed_at"] = _iso_now()
         st["error_code"] = error_code
         st["message"] = message
+        st["is_retrying"] = False
         if extra:
             st.setdefault("extra", {}).update(extra)
 
@@ -351,6 +517,8 @@ async def skip_stage(job_id: str, stage_name: str, message: Optional[str] = "B�
         st["completed_at"] = None
         st["duration_ms"] = None
         st["progress"] = None
+        st["automatic_attempt"] = None
+        st["is_retrying"] = False
 
         job_info["progress"] = calculate_global_progress(stages)
         await save_job_info_atomic(job_id, job_info)
@@ -359,9 +527,11 @@ async def skip_stage(job_id: str, stage_name: str, message: Optional[str] = "B�
 
 async def reset_failed_stages_for_retry(job_id: str, resume_from_failed: bool = True) -> Optional[Dict[str, Any]]:
     """
-    Khôi phục trạng thái Job để thực hiện Retry:
-    - Nếu resume_from_failed=True: Giữ nguyên các stage đã completed trước đó, chỉ reset stage bị failed (và các stage sau nó) về pending.
-    - Nếu resume_from_failed=False: Reset toàn bộ các stage về pending (chạy lại từ đầu).
+    Khôi phục trạng thái Job để thực hiện Retry theo cơ chế Strict RetryPlan:
+    - Xác định failed_stage và resume_stage.
+    - Giữ nguyên 100% các stage trong preserved_stages (completed, progress=100%, timestamp, duration).
+    - Tái tạo initial_progress thực tế cho resume_stage từ checkpoint đĩa (không reset về 0%).
+    - Đặt các stage downstream trong execution_plan sang pending.
     """
     lock = _get_job_lock(job_id)
     async with lock:
@@ -370,14 +540,50 @@ async def reset_failed_stages_for_retry(job_id: str, resume_from_failed: bool = 
             return None
 
         stages = job_info.setdefault("stages", {})
-        found_failure = False
+        now_iso = _iso_now()
 
-        for name in list(STAGE_DEFINITIONS.keys()):
-            if name in ["upload", "metadata"]:
-                continue
+        # 1. Tìm failed_stage đầu tiên trong CANONICAL_STAGE_ORDER
+        failed_stage = None
+        for name in CANONICAL_STAGE_ORDER:
+            st = stages.get(name, {})
+            if st.get("status") == "failed":
+                failed_stage = name
+                break
 
-            st = stages.setdefault(name, {})
-            current_st_status = st.get("status")
+        if not failed_stage and job_info.get("status") == "failed":
+            curr = job_info.get("current_stage")
+            if curr in CANONICAL_STAGE_ORDER:
+                failed_stage = curr
+            else:
+                for name in CANONICAL_STAGE_ORDER:
+                    if stages.get(name, {}).get("status") not in ["completed", "skipped"]:
+                        failed_stage = name
+                        break
+
+        if not resume_from_failed:
+            failed_stage = None
+            resume_stage = CANONICAL_STAGE_ORDER[0]
+            resume_idx = 0
+        elif not failed_stage:
+            resume_stage = CANONICAL_STAGE_ORDER[0]
+            resume_idx = 0
+        else:
+            resume_stage = failed_stage
+            resume_idx = CANONICAL_STAGE_ORDER.index(resume_stage)
+
+        preserved_stages = CANONICAL_STAGE_ORDER[:resume_idx]
+        execution_plan = CANONICAL_STAGE_ORDER[resume_idx:]
+
+        # 2. Xử lý từng stage theo RetryPlan
+        job_paths = get_job_paths(job_id)
+
+        for name in CANONICAL_STAGE_ORDER:
+            st = stages.setdefault(name, {
+                "name": name,
+                "label": STAGE_DEFINITIONS.get(name, {}).get("label", name),
+                "status": "pending",
+                "progress": 0.0,
+            })
 
             if not resume_from_failed:
                 st["status"] = "pending"
@@ -387,8 +593,99 @@ async def reset_failed_stages_for_retry(job_id: str, resume_from_failed: bool = 
                 st["completed_at"] = None
                 st["duration_ms"] = None
                 st["progress"] = 0.0
-            elif current_st_status == "failed" or found_failure:
-                found_failure = True
+                st["automatic_attempt"] = None
+                st["is_retrying"] = False
+            elif name in preserved_stages:
+                # BẢO TOÀN NGUYÊN VẸN 100% UPSTREAM STAGES
+                st["status"] = "completed"
+                st["error_code"] = None
+                st["automatic_attempt"] = None
+                st["is_retrying"] = False
+                if st.get("progress") is None or st.get("progress", 0.0) < 100.0:
+                    st["progress"] = 100.0
+            elif name == resume_stage:
+                # Stage phục hồi: Khôi phục tiến độ thực từ checkpoint
+                initial_pct = 0.0
+                initial_msg = "Đang khởi động lại từ đoạn bị lỗi..."
+
+                if resume_stage == "tts" and job_paths:
+                    tts_dir = job_paths.get("tts_dir")
+                    if tts_dir and tts_dir.exists():
+                        # Xóa file 0-byte hoặc < MIN_VALID_AUDIO_BYTES (Invariant 2)
+                        for mp3_f in tts_dir.glob("segment_*.mp3"):
+                            try:
+                                if mp3_f.stat().st_size < MIN_VALID_AUDIO_BYTES:
+                                    mp3_f.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
+                        mp3_files = [f for f in tts_dir.glob("segment_*.mp3") if f.stat().st_size >= MIN_VALID_AUDIO_BYTES]
+                        chk_file = tts_dir / "tts_chunks_state.json"
+                        trans_file = job_paths.get("transcript_dir", Path()) / "translated_transcript.json"
+                        orig_trans_file = job_paths.get("transcript_dir", Path()) / "transcript.json"
+
+                        total_chunks = len(job_info.get("segments", []))
+                        if total_chunks == 0 and trans_file.exists():
+                            try:
+                                with open(trans_file, "r", encoding="utf-8") as tf:
+                                    td = json.load(tf)
+                                    total_chunks = len(td.get("speech_chunks") or td.get("segments", []))
+                            except Exception:
+                                pass
+                        if total_chunks == 0 and orig_trans_file.exists():
+                            try:
+                                with open(orig_trans_file, "r", encoding="utf-8") as of:
+                                    od = json.load(of)
+                                    total_chunks = len(od.get("speech_chunks") or od.get("segments", []))
+                            except Exception:
+                                pass
+                        if chk_file.exists():
+                            try:
+                                with open(chk_file, "r", encoding="utf-8") as cf:
+                                    chk_data = json.load(cf)
+                                    total_chunks = max(total_chunks, len(chk_data))
+                            except Exception:
+                                pass
+
+                        completed_chunks = len(mp3_files)
+                        if total_chunks > 0:
+                            initial_pct = round((completed_chunks / max(1, total_chunks)) * 100.0, 1)
+                            initial_msg = (
+                                f"Đang tiếp tục tổng hợp {completed_chunks}/{total_chunks} SpeechChunks ({initial_pct}%)"
+                                if completed_chunks > 0
+                                else "Đang tổng hợp giọng đọc AI..."
+                            )
+                        else:
+                            initial_pct = st.get("progress", 0.0) or 0.0
+
+                elif resume_stage == "translation" and job_paths:
+                    trans_file = job_paths.get("transcript_dir", Path()) / "translated_transcript.json"
+                    if trans_file.exists():
+                        try:
+                            with open(trans_file, "r", encoding="utf-8") as tf:
+                                t_data = json.load(tf)
+                                t_chunks = t_data.get("speech_chunks") or t_data.get("segments", [])
+                                done_t = len([c for c in t_chunks if (c.get("translated_text") or "").strip() != (c.get("original_text") or "").strip()])
+                                total_t = len(t_chunks)
+                                if total_t > 0:
+                                    initial_pct = round((done_t / max(1, total_t)) * 100.0, 1)
+                                    initial_msg = f"Đang tiếp tục dịch thuật ({done_t}/{total_t} câu, {initial_pct}%)..."
+                        except Exception:
+                            initial_pct = st.get("progress", 0.0) or 0.0
+                else:
+                    initial_pct = st.get("progress", 0.0) or 0.0
+
+                st["status"] = "running"
+                st["message"] = initial_msg
+                st["error_code"] = None
+                st["started_at"] = now_iso
+                st["completed_at"] = None
+                st["duration_ms"] = None
+                st["progress"] = initial_pct
+                st["automatic_attempt"] = None
+                st["is_retrying"] = False
+            else:
+                # Downstream stages trong execution_plan
                 st["status"] = "pending"
                 st["message"] = "Chờ xử lý (Thử lại)"
                 st["error_code"] = None
@@ -396,11 +693,123 @@ async def reset_failed_stages_for_retry(job_id: str, resume_from_failed: bool = 
                 st["completed_at"] = None
                 st["duration_ms"] = None
                 st["progress"] = 0.0
+                st["automatic_attempt"] = None
+                st["is_retrying"] = False
+
+        retry_plan = {
+            "mode": "resume" if resume_from_failed else "rerun_all",
+            "failed_stage": failed_stage,
+            "resume_stage": resume_stage,
+            "resume_index": resume_idx,
+            "retry_scope": "failed_items" if (resume_from_failed and resume_stage in ["tts", "translation"]) else "stage",
+            "preserve_upstream": bool(preserved_stages),
+            "preserved_stages": preserved_stages,
+            "execution_plan": execution_plan,
+            "initial_progress": stages.get(resume_stage, {}).get("progress", 0.0) if resume_stage else 0.0,
+        }
 
         job_info["status"] = "processing"
         job_info["error"] = None
+        job_info["current_stage"] = resume_stage
+        job_info["retry_plan"] = retry_plan
         job_info["retry_count"] = job_info.get("retry_count", 0) + 1
-        job_info["last_retry_at"] = _iso_now()
+        job_info["last_retry_at"] = now_iso
+        job_info["progress"] = calculate_global_progress(stages)
+        await save_job_info_atomic(job_id, job_info)
+        return job_info
+
+
+async def prepare_job_for_reprocess(
+    job_id: str,
+    new_config: Dict[str, Any],
+    dirty_stages: List[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Chuẩn bị trạng thái Job để xử lý lại (Reprocess) khi cấu hình thay đổi:
+    - Xác định earliest_dirty_stage từ CANONICAL_STAGE_ORDER.
+    - Bảo toàn 100% upstream stages (status='completed', progress=100%, timestamps).
+    - Invalidate các downstream stages dirty: đặt status='pending', message='Chờ xử lý (Cấu hình thay đổi)', progress=0.0.
+    - Đánh dấu artifact final_video cũ: current=False, reprocessing=True.
+    - Cập nhật config_snapshot và tăng config_revision.
+    """
+    lock = _get_job_lock(job_id)
+    async with lock:
+        job_info = await load_job_info(job_id)
+        if not job_info:
+            return None
+
+        stages = job_info.setdefault("stages", {})
+
+        if not dirty_stages:
+            return job_info
+
+        earliest_dirty_stage = None
+        for name in CANONICAL_STAGE_ORDER:
+            if name in dirty_stages:
+                earliest_dirty_stage = name
+                break
+
+        if not earliest_dirty_stage:
+            earliest_dirty_stage = CANONICAL_STAGE_ORDER[0]
+
+        earliest_idx = CANONICAL_STAGE_ORDER.index(earliest_dirty_stage)
+        preserved_stages = CANONICAL_STAGE_ORDER[:earliest_idx]
+        execution_plan = CANONICAL_STAGE_ORDER[earliest_idx:]
+
+        for name in CANONICAL_STAGE_ORDER:
+            st = stages.setdefault(name, {
+                "name": name,
+                "label": STAGE_DEFINITIONS.get(name, {}).get("label", name),
+                "status": "pending",
+                "progress": 0.0,
+            })
+
+            if name in preserved_stages:
+                # BẢO TOÀN NGUYÊN VẸN UPSTREAM STAGES
+                st["status"] = "completed"
+                st["error_code"] = None
+                st["automatic_attempt"] = None
+                st["is_retrying"] = False
+                if st.get("progress") is None or st.get("progress", 0.0) < 100.0:
+                    st["progress"] = 100.0
+            else:
+                # DOWNSTREAM DIRTY STAGES
+                st["status"] = "pending"
+                st["message"] = "Chờ xử lý (Cấu hình thay đổi)" if name == earliest_dirty_stage else "Chờ xử lý"
+                st["error_code"] = None
+                st["started_at"] = None
+                st["completed_at"] = None
+                st["duration_ms"] = None
+                st["progress"] = 0.0
+                st["automatic_attempt"] = None
+                st["is_retrying"] = False
+
+        # Invalidate artifacts
+        artifacts = job_info.setdefault("artifacts", {})
+        if "final_video" in artifacts:
+            artifacts["final_video"]["current"] = False
+            artifacts["final_video"]["reprocessing"] = True
+        if "video" in job_info and isinstance(job_info["video"], dict):
+            job_info["video"]["current"] = False
+            job_info["video"]["reprocessing"] = True
+
+        reprocess_plan = {
+            "mode": "reprocess",
+            "earliest_dirty_stage": earliest_dirty_stage,
+            "dirty_stages": dirty_stages,
+            "resume_stage": earliest_dirty_stage,
+            "resume_index": earliest_idx,
+            "preserve_upstream": bool(preserved_stages),
+            "preserved_stages": preserved_stages,
+            "execution_plan": execution_plan,
+        }
+
+        job_info["status"] = "processing"
+        job_info["error"] = None
+        job_info["current_stage"] = earliest_dirty_stage
+        job_info["retry_plan"] = reprocess_plan
+        job_info["config_snapshot"] = new_config
+        job_info["config_revision"] = job_info.get("config_revision", 0) + 1
         job_info["progress"] = calculate_global_progress(stages)
         await save_job_info_atomic(job_id, job_info)
         return job_info
@@ -484,3 +893,142 @@ def delete_job_sync(job_id: str) -> bool:
 async def delete_job(job_id: str) -> bool:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, delete_job_sync, job_id)
+
+
+def recover_stale_running_jobs_sync(jobs_dir: Optional[Path] = None) -> List[str]:
+    """
+    Quét và thu hồi các zombie jobs khi server khởi động dựa trên RUNTIME_INSTANCE_ID (Invariant 4):
+    - Kiểm tra các job có status == "processing" hoặc stage running nhưng worker_instance_id != RUNTIME_INSTANCE_ID.
+    - Reconcile đĩa: Xóa các file 0-byte trong tts_dir, đếm chính xác số file MP3 hợp lệ (>= MIN_VALID_AUDIO_BYTES).
+    - Cập nhật trạng thái: job.status = "failed", stage.status = "failed",
+      error_code = "TASK_INTERRUPTED_SERVER_RESTART",
+      error = "Tiến trình bị gián đoạn do máy chủ khởi động lại. Bấm 'Thử lại' để tiếp tục từ vị trí đã dừng.".
+    - Tái dựng progress = (valid_completed / total) * 100.0%.
+    """
+    from backend.config import JOBS_DIR as CONFIG_JOBS_DIR, RUNTIME_INSTANCE_ID, MIN_VALID_AUDIO_BYTES
+    target_jobs_dir = jobs_dir or CONFIG_JOBS_DIR
+    if not target_jobs_dir.exists():
+        return []
+
+    recovered_job_ids = []
+    for item in target_jobs_dir.iterdir():
+        if not item.is_dir():
+            continue
+        job_file = item / "job_info.json"
+        if not job_file.exists() or job_file.stat().st_size == 0:
+            continue
+
+        job_id = item.name
+        try:
+            with open(job_file, "r", encoding="utf-8") as f:
+                job_info = json.load(f)
+
+            if not job_info or not isinstance(job_info, dict):
+                continue
+
+            status = job_info.get("status")
+            stages = job_info.get("stages", {})
+            has_running_stage = any(s.get("status") == "running" for s in stages.values())
+            worker_id = job_info.get("worker_instance_id")
+
+            is_zombie = (status == "processing" or has_running_stage) and (worker_id != RUNTIME_INSTANCE_ID)
+
+            if is_zombie:
+                logger.warning(
+                    f"[WATCHDOG] Phát hiện Zombie Job '{job_id}' (worker_id={worker_id} != {RUNTIME_INSTANCE_ID}). "
+                    f"Tiến hành thu hồi và reconcile trạng thái..."
+                )
+
+                # 1. Reconcile tts_dir: Xóa file rỗng / corrupted
+                tts_dir = item / "tts"
+                valid_mp3_count = 0
+                if tts_dir.exists():
+                    for mp3_f in tts_dir.glob("segment_*.mp3"):
+                        try:
+                            if mp3_f.stat().st_size < MIN_VALID_AUDIO_BYTES:
+                                mp3_f.unlink(missing_ok=True)
+                                logger.info(f"[WATCHDOG] Đã xóa file audio rỗng/hỏng: {mp3_f.name}")
+                            else:
+                                valid_mp3_count += 1
+                        except Exception:
+                            pass
+
+                # Đọc tổng số chunks từ translated_transcript hoặc transcript hoặc segments
+                total_chunks = len(job_info.get("segments", []))
+                trans_file = item / "transcripts" / "translated_transcript.json"
+                orig_trans_file = item / "transcripts" / "transcript.json"
+                chk_file = tts_dir / "tts_chunks_state.json"
+
+                if total_chunks == 0 and trans_file.exists():
+                    try:
+                        with open(trans_file, "r", encoding="utf-8") as tf:
+                            td = json.load(tf)
+                            total_chunks = len(td.get("speech_chunks") or td.get("segments", []))
+                    except Exception:
+                        pass
+                if total_chunks == 0 and orig_trans_file.exists():
+                    try:
+                        with open(orig_trans_file, "r", encoding="utf-8") as of:
+                            od = json.load(of)
+                            total_chunks = len(od.get("speech_chunks") or od.get("segments", []))
+                    except Exception:
+                        pass
+                if chk_file.exists():
+                    try:
+                        with open(chk_file, "r", encoding="utf-8") as cf:
+                            cd = json.load(cf)
+                            total_chunks = max(total_chunks, len(cd))
+                    except Exception:
+                        pass
+
+                # 2. Cập nhật các stage đang running sang failed
+                restart_msg = "Tiến trình bị gián đoạn do máy chủ khởi động lại. Bấm 'Thử lại' để tiếp tục từ vị trí đã dừng."
+                for s_name, s_data in stages.items():
+                    if s_data.get("status") == "running":
+                        s_data["status"] = "failed"
+                        s_data["error_code"] = "TASK_INTERRUPTED_SERVER_RESTART"
+                        s_data["message"] = restart_msg
+                        s_data["completed_at"] = _iso_now()
+                        s_data["is_retrying"] = False
+                        if s_name == "tts" and total_chunks > 0:
+                            tts_pct = round((valid_mp3_count / max(1, total_chunks)) * 100.0, 1)
+                            s_data["progress"] = tts_pct
+                            s_data.setdefault("extra", {})["completed_chunks"] = valid_mp3_count
+                            s_data.setdefault("extra", {})["total_chunks"] = total_chunks
+
+                job_info["status"] = "failed"
+                job_info["error"] = restart_msg
+                job_info["progress"] = calculate_global_progress(stages)
+
+                temp_file = item / f"job_info_{int(time.time()*1000)}.tmp"
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(job_info, f, indent=2, ensure_ascii=False)
+                for attempt in range(5):
+                    try:
+                        os.replace(str(temp_file), str(job_file))
+                        break
+                    except (PermissionError, OSError):
+                        if attempt == 4:
+                            with open(job_file, "w", encoding="utf-8") as f:
+                                json.dump(job_info, f, indent=2, ensure_ascii=False)
+                        else:
+                            time.sleep(0.01 * (attempt + 1))
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+                recovered_job_ids.append(job_id)
+                logger.info(f"[WATCHDOG] Đã thu hồi thành công Job '{job_id}' (Progress: {job_info.get('progress')}%)")
+
+        except Exception as e:
+            logger.error(f"[WATCHDOG] Lỗi khi reconcile job {job_id}: {e}", exc_info=True)
+
+    return recovered_job_ids
+
+
+async def recover_stale_running_jobs(jobs_dir: Optional[Path] = None) -> List[str]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, recover_stale_running_jobs_sync, jobs_dir)
+
